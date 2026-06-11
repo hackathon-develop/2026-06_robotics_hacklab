@@ -11,9 +11,14 @@ import {
   type GripperVisualization,
   initGripperVisualization
 } from './visualizations/gripper';
+import {
+  initRobotVisualization,
+  type RobotVisualization
+} from './visualizations/robot';
 
 let dummyVisualization: DummyVisualization | null = null;
 let gripperVisualization: GripperVisualization | null = null;
+let robotVisualization: RobotVisualization | null = null;
 
 function initialize(): void {
   const dummyPanel = document.getElementById('dummy-visualization');
@@ -33,6 +38,16 @@ function initialize(): void {
 
     void initGripperVisualization(gripperPanel).then(viz => {
       gripperVisualization = viz;
+    });
+  }
+
+  const robotPanel = document.getElementById('robot-visualization');
+  if (robotPanel) {
+    robotVisualization?.destroy();
+    robotVisualization = null;
+
+    void initRobotVisualization(robotPanel).then(viz => {
+      robotVisualization = viz;
     });
   }
 }
