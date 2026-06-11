@@ -19,6 +19,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - uses: astral-sh/setup-uv@v5
       - name: "Install JS dependencies"
         working-directory: ts
         run: pnpm i
@@ -45,3 +46,11 @@ jobs:
       - name: "Build TS project"
         working-directory: ts
         run: pnpm build
+      - name: "Run ruff"
+        working-directory: py
+        run: uv run ruff check .
+      - name: "Install mesh generation system dependencies"
+        run: sudo apt-get update && sudo apt-get install -y libopengl0
+      - name: "Generate meshes"
+        working-directory: py
+        run: uv run python scripts/simplify_meshes.py

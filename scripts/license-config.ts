@@ -28,7 +28,7 @@ export const config: LicenseConfig = {
   rules: [
     // All files with 0BSD
     {
-      files: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx', '**/*.mjs', '**/*.sh', '**/*.html', '**/*.css', '**/*.md', '**/*.ipynb'],
+      files: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx', '**/*.mjs', '**/*.py', '**/*.sh', '**/*.html', '**/*.css', '**/*.md', '**/*.ipynb'],
       license: '0BSD',
       description: 'All project files'
     }
