@@ -3,8 +3,8 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
+import { glbName, loadMesh } from '../../mesh-loader';
 import { LINKS, type VisualDefinition } from '../robot/scene';
 
 export interface BodyTreeVisualization {
@@ -58,7 +58,7 @@ export function initializeBodyTreeVisualization(
       <div class="body-tree-viewport"></div>
       <div class="body-tree-info">
         <strong>Loading mesh diagnostics…</strong>
-        <span>File size and polygon counts are calculated from the served STL files.</span>
+        <span>File size and polygon counts are calculated from the served Meshopt GLBs.</span>
       </div>
     </section>`;
   parent.querySelector('.placeholder')?.replaceWith(root);
@@ -93,7 +93,6 @@ export function initializeBodyTreeVisualization(
   const selected = new THREE.MeshStandardMaterial({
     color: 0x38bdf8, emissive: 0x075985, roughness: 0.35
   });
-  const loader = new STLLoader();
   const basePath = modelBasePath.replace(/\/$/, '');
   const bodies = new Map<string, THREE.Group>();
   const meshes = new Map<string, THREE.Mesh>();
@@ -179,13 +178,9 @@ export function initializeBodyTreeVisualization(
           title="Hide geom" aria-label="Hide ${visual.mesh}" aria-checked="true">●</span>`;
       bodyRow.appendChild(row);
       rows.set(id, row);
-      fetch(`${basePath}/${visual.mesh}`).then(response => {
-        if (!response.ok) { throw new Error(`Unable to load ${visual.mesh}`); }
-        return response.arrayBuffer();
-      }).then(buffer => {
-        const geometry = loader.parse(buffer);
+      loadMesh(`${basePath}/${glbName(visual.mesh)}`).then(({ bytes, geometry }) => {
         const metrics = {
-          bytes: buffer.byteLength,
+          bytes,
           triangles: geometry.index
             ? geometry.index.count / 3
             : geometry.getAttribute('position').count / 3,
@@ -215,7 +210,7 @@ export function initializeBodyTreeVisualization(
           }), { bytes: 0, triangles: 0, vertices: 0 });
           info.innerHTML = `<strong>Full robot mesh set</strong>
             <span>${metricsLabel(all)} · ${formatCount(all.vertices)} vertices ·
-              ${meshMetrics.size} STL instances</span>`;
+              ${meshMetrics.size} GLB instances</span>`;
         }
       }).catch((error: unknown) => {
         requiredElement(row, 'small').textContent = 'load error';

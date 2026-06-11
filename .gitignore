@@ -7,3 +7,4 @@ dist
 build
 pnpm-lock.yaml
 *.log
+/intermediary-glb

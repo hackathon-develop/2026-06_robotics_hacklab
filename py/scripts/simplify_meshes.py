@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Mario Gemoll
 # SPDX-License-Identifier: 0BSD
 
-"""Generate simplified SO101 visual meshes.
+"""Generate simplified SO101 intermediary GLBs.
 
 Decimates every source STL to RATIO of its faces (MeshLab quadric edge
 collapse). If the result deviates from the original by more than TARGET_MM
@@ -25,7 +25,7 @@ TARGET_MM = 0.5
 
 ROOT = Path(__file__).resolve().parents[2]
 INPUT_DIR = ROOT / "SO-ARM100" / "Simulation" / "SO101" / "assets"
-OUTPUT_DIR = ROOT / "ts" / "public" / "so101_assets"
+GLB_DIR = ROOT / "intermediary-glb"
 
 
 def decimate(mesh, ratio: float):
@@ -37,7 +37,13 @@ def decimate(mesh, ratio: float):
             continue
         ms = pymeshlab.MeshSet()
         ms.add_mesh(pymeshlab.Mesh(component.vertices, component.faces))
-        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target)
+        ms.meshing_decimation_quadric_edge_collapse(
+            targetfacenum=target,
+            preserveboundary=True,
+            boundaryweight=2.0,
+            preservenormal=True,
+            preservetopology=True,
+        )
         result = ms.current_mesh()
         reduced.append(trimesh.Trimesh(result.vertex_matrix(), result.face_matrix()))
     return trimesh.util.concatenate(reduced)
@@ -51,7 +57,7 @@ def deviation_mm(original, reduced, samples: int = 1500) -> float:
 
 def main() -> int:
     np.random.seed(0)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    GLB_DIR.mkdir(parents=True, exist_ok=True)
     paths = sorted(INPUT_DIR.glob("*.stl"))
     if not paths:
         raise SystemExit(f"no STL meshes found in: {INPUT_DIR}")
@@ -72,7 +78,7 @@ def main() -> int:
                     ratio, reduced, error, high = mid, candidate, candidate_error, mid
                 else:
                     low = mid
-        reduced.export(OUTPUT_DIR / path.name)
+        reduced.export(GLB_DIR / path.with_suffix(".glb").name)
         tqdm.write(f"{path.name:42} {len(mesh.faces):7d} {ratio:6.3f} {len(reduced.faces):6d} "
                    f"{error:5.2f}mm")
     return 0

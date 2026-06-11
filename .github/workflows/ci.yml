@@ -26,6 +26,17 @@ jobs:
       - name: "Install script dependencies"
         working-directory: scripts
         run: pnpm i
+      - name: "Run ruff"
+        working-directory: py
+        run: uv run ruff check .
+      - name: "Install mesh generation system dependencies"
+        run: sudo apt-get update && sudo apt-get install -y libopengl0
+      - name: "Generate meshes"
+        working-directory: py
+        run: uv run python scripts/simplify_meshes.py
+      - name: "Optimize meshes"
+        working-directory: ts
+        run: pnpm run optimize-meshes
       - name: "ESLint the ESLint config"
         working-directory: ts
         run: pnpm eslint -c basic.eslint.config.js basic.eslint.config.js eslint.config.js
@@ -46,11 +57,3 @@ jobs:
       - name: "Build TS project"
         working-directory: ts
         run: pnpm build
-      - name: "Run ruff"
-        working-directory: py
-        run: uv run ruff check .
-      - name: "Install mesh generation system dependencies"
-        run: sudo apt-get update && sudo apt-get install -y libopengl0
-      - name: "Generate meshes"
-        working-directory: py
-        run: uv run python scripts/simplify_meshes.py

@@ -3,8 +3,8 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
+import { glbName, loadMesh } from '../../mesh-loader';
 import { CANVAS_HEIGHT, CANVAS_WIDTH } from './ui';
 
 export interface VisualDefinition {
@@ -141,7 +141,6 @@ export function createRobotScene(
 
   const printedMaterial = new THREE.MeshStandardMaterial({ color: 0xffb000, roughness: 0.55 });
   const motorMaterial = new THREE.MeshStandardMaterial({ color: 0x292d32, roughness: 0.7 });
-  const loader = new STLLoader();
   const basePath = modelBasePath.endsWith('/') ? modelBasePath.slice(0, -1) : modelBasePath;
   const links = new Map<string, THREE.Group>();
   const jointPivots = new Map<string, THREE.Group>();
@@ -168,7 +167,7 @@ export function createRobotScene(
     }
 
     for (const visual of link.visuals) {
-      loader.load(`${basePath}/${visual.mesh}`, geometry => {
+      loadMesh(`${basePath}/${glbName(visual.mesh)}`).then(({ geometry }) => {
         const material = visual.motor === true ? motorMaterial : printedMaterial;
         const mesh = new THREE.Mesh(geometry, material);
         mesh.position.set(...visual.position);
@@ -176,7 +175,7 @@ export function createRobotScene(
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         linkGroup.add(mesh);
-      });
+      }).catch(console.error);
     }
   }
 
