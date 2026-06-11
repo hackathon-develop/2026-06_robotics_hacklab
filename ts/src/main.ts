@@ -4,6 +4,10 @@
 import './style.css';
 
 import {
+  type BodyTreeVisualization,
+  initBodyTreeVisualization
+} from './visualizations/body-tree';
+import {
   type DummyVisualization,
   initDummyVisualization
 } from './visualizations/dummy';
@@ -19,6 +23,7 @@ import {
 let dummyVisualization: DummyVisualization | null = null;
 let gripperVisualization: GripperVisualization | null = null;
 let robotVisualization: RobotVisualization | null = null;
+let bodyTreeVisualization: BodyTreeVisualization | null = null;
 
 function initialize(): void {
   const dummyPanel = document.getElementById('dummy-visualization');
@@ -48,6 +53,14 @@ function initialize(): void {
 
     void initRobotVisualization(robotPanel).then(viz => {
       robotVisualization = viz;
+    });
+  }
+
+  const bodyTreePanel = document.getElementById('body-tree-visualization');
+  if (bodyTreePanel) {
+    bodyTreeVisualization?.destroy();
+    void initBodyTreeVisualization(bodyTreePanel).then(viz => {
+      bodyTreeVisualization = viz;
     });
   }
 }

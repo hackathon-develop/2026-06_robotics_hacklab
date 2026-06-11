@@ -54,6 +54,146 @@ canvas {
   height: 100%;
 }
 
+.body-tree-root {
+  display: grid;
+  grid-template-columns: 350px minmax(0, 1fr);
+  max-width: 1100px;
+  min-height: 600px;
+  margin: 0 auto;
+  overflow: hidden;
+  background: #f4f8ff;
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgb(31 41 55 / 15%);
+}
+
+.body-tree-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: #fff;
+  border-right: 1px solid #dbe3ee;
+}
+
+.body-tree-sidebar header {
+  display: flex;
+  justify-content: space-between;
+  padding: 1rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.body-tree-info span,
+.body-tree-sidebar header span {
+  color: #64748b;
+  font-size: 0.78rem;
+}
+
+.body-tree-search {
+  margin: 0.75rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+}
+
+.body-tree-list {
+  overflow: auto;
+  padding: 0 0.55rem 1rem;
+}
+
+.body-tree-body summary,
+.body-tree-geom {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr) auto 1.25rem;
+  align-items: center;
+  width: 100%;
+  gap: 0.35rem;
+  padding: 0.45rem;
+  color: #334155;
+  text-align: left;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+}
+
+.body-tree-geom {
+  padding-left: 1.7rem;
+  font-size: 0.75rem;
+}
+
+.body-tree-body summary:hover,
+.body-tree-geom:hover,
+.body-tree-body summary.selected,
+.body-tree-geom.selected {
+  color: #075985;
+  background: #e0f2fe;
+}
+
+.body-tree-body small {
+  color: #94a3b8;
+  font-size: 0.65rem;
+}
+
+.body-tree-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  color: #0ea5e9;
+  font-size: 0.6rem;
+  cursor: pointer;
+  background: #e0f2fe;
+  border: 0;
+  border-radius: 50%;
+}
+
+.body-tree-toggle.off {
+  color: #94a3b8;
+  background: #e2e8f0;
+  opacity: 0.65;
+}
+
+.body-tree-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 1.15rem;
+  height: 1.15rem;
+  color: #fff;
+  font-size: 0.62rem;
+  font-weight: 700;
+  background: #475569;
+  border-radius: 4px;
+}
+
+.body-tree-geom .body-tree-icon {
+  background: #d97706;
+}
+
+.body-tree-inspector {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-width: 0;
+}
+
+.body-tree-viewport {
+  min-width: 0;
+  height: 540px;
+}
+
+.body-tree-viewport canvas {
+  width: 100%;
+  height: 100%;
+}
+
+.body-tree-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.75rem 1rem;
+  background: #fff;
+  border-top: 1px solid #dbe3ee;
+}
+
 .robot-viz-controls {
   padding: 1rem;
   background: #fff;
@@ -103,5 +243,15 @@ canvas {
   .robot-viz-controls {
     border-top: 1px solid #dbe3ee;
     border-left: 0;
+  }
+
+  .body-tree-root {
+    grid-template-columns: 1fr;
+  }
+
+  .body-tree-sidebar {
+    max-height: 360px;
+    border-right: 0;
+    border-bottom: 1px solid #dbe3ee;
   }
 }

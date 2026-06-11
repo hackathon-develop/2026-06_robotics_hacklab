@@ -7,14 +7,14 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
 import { CANVAS_HEIGHT, CANVAS_WIDTH } from './ui';
 
-interface VisualDefinition {
+export interface VisualDefinition {
   mesh: string;
   position: [number, number, number];
   rotation: [number, number, number];
   motor?: boolean;
 }
 
-interface LinkDefinition {
+export interface LinkDefinition {
   name: string;
   visuals: VisualDefinition[];
   joint?: {
@@ -34,7 +34,7 @@ export const JOINTS = [
   { name: 'gripper', label: 'Gripper', lower: -0.174533, upper: 1.74533, value: 0 }
 ] as const;
 
-const LINKS: LinkDefinition[] = [
+export const LINKS: LinkDefinition[] = [
   /* eslint-disable max-len -- Keep calibrated URDF transforms readable as single records. */
   {
     name: 'base_link',
