@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Mario Gemoll
 // SPDX-License-Identifier: 0BSD
 
-import { buildUi } from './ui';
 import { createDummyScene } from './scene';
+import { buildUi } from './ui';
 
 export interface DummyVisualization {
   destroy(): void;
 }
 
-export async function initializeDummyVisualization(
+export function initializeDummyVisualization(
   parent: HTMLElement
 ): Promise<DummyVisualization> {
   const ui = buildUi(parent);
@@ -33,12 +33,12 @@ export async function initializeDummyVisualization(
 
   animate();
 
-  return {
+  return Promise.resolve({
     destroy(): void {
       destroyed = true;
       window.cancelAnimationFrame(animationFrameId);
       vizScene.destroy();
       ui.root.remove();
     }
-  };
+  });
 }

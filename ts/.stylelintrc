@@ -1,0 +1,11 @@
+{
+  "extends": "stylelint-config-standard",
+  "plugins": [
+    "@stylistic/stylelint-plugin"
+  ],
+  "rules": {
+    "@stylistic/indentation": 2,
+    "@stylistic/no-eol-whitespace": true,
+    "@stylistic/no-missing-end-of-source-newline": true
+  }
+}

@@ -1,0 +1,9 @@
+.DS_Store
+.claude
+.pnpm-store
+.vscode
+node_modules
+dist
+build
+pnpm-lock.yaml
+*.log

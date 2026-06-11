@@ -3,7 +3,8 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { CANVAS_WIDTH, CANVAS_HEIGHT } from './ui';
+
+import { CANVAS_HEIGHT,CANVAS_WIDTH } from './ui';
 
 export interface DummyScene {
   scene: THREE.Scene;

@@ -1,0 +1,46 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: "Check for large files"
+        run: scripts/check_files_in_repo.sh
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: "Install JS dependencies"
+        working-directory: ts
+        run: pnpm i
+      - name: "Install script dependencies"
+        working-directory: scripts
+        run: pnpm i
+      - name: "ESLint the ESLint config"
+        working-directory: ts
+        run: pnpm eslint -c basic.eslint.config.js basic.eslint.config.js eslint.config.js
+      - name: "ESLint"
+        working-directory: ts
+        run: pnpm eslint src
+      - name: "Run TS type checks"
+        working-directory: ts
+        run: pnpm run typecheck
+      - name: "Run TS tests"
+        working-directory: ts
+        run: pnpm test
+      - name: "Run stylelint"
+        working-directory: ts
+        run: pnpm stylelint "src/**/*.css"
+      - name: "Check license headers"
+        run: scripts/check-license-headers.sh
+      - name: "Build TS project"
+        working-directory: ts
+        run: pnpm build

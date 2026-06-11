@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Mario Gemoll
 // SPDX-License-Identifier: 0BSD
 
-import './style.css'
+import './style.css';
+
 import {
   type DummyVisualization,
   initDummyVisualization
-} from './visualizations/dummy'
+} from './visualizations/dummy';
 
 let visualization: DummyVisualization | null = null;
 
