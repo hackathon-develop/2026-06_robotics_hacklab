@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Mario Gemoll
 // SPDX-License-Identifier: 0BSD
 
+import * as THREE from 'three';
+
 import { loadWebModel } from '../../web-model';
 import { createRobotScene } from './scene';
 import { buildUi, formatDegrees } from './ui';
@@ -29,7 +31,21 @@ export async function initializeRobotVisualization(
       value: 0
     }];
   });
-  const ui = buildUi(parent, joints);
+
+  const visualMaterialNames = new Set(
+    model.bodies.flatMap(b => b.geometries)
+      .filter(g => g.role === 'visual')
+      .map(g => g.material)
+  );
+  const materialColors = Object.entries(model.materials)
+    .filter(([name]) => visualMaterialNames.has(name))
+    .map(([name, [r, g, b]]) => ({
+      name,
+      label: name.charAt(0).toUpperCase() + name.slice(1),
+      hexColor: `#${new THREE.Color(r, g, b).getHexString()}`
+    }));
+
+  const ui = buildUi(parent, joints, materialColors);
   const vizScene = createRobotScene(ui.viewport, model, options.modelBasePath);
   const { renderer, camera, scene, orbitControls } = vizScene;
   const listeners: (() => void)[] = [];
@@ -44,6 +60,14 @@ export async function initializeRobotVisualization(
     };
     control.input.addEventListener('input', update);
     listeners.push(() => { control.input.removeEventListener('input', update); });
+  }
+
+  for (const [matName, colorInput] of ui.colorInputs) {
+    const update = (): void => {
+      vizScene.setMaterialColor(matName, new THREE.Color(colorInput.value));
+    };
+    colorInput.addEventListener('input', update);
+    listeners.push(() => { colorInput.removeEventListener('input', update); });
   }
 
   const reset = (): void => {

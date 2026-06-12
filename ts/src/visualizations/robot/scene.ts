@@ -17,6 +17,7 @@ export interface RobotScene {
   camera: THREE.PerspectiveCamera;
   orbitControls: OrbitControls;
   setJoint(name: string, radians: number): void;
+  setMaterialColor(materialName: string, color: THREE.Color): void;
   resize(): void;
   destroy(): void;
 }
@@ -74,11 +75,18 @@ export function createRobotScene(
     setJoint(name: string, radians: number): void {
       setJointAngle(model, builtModel.jointPivots, name, radians);
     },
+    setMaterialColor(materialName: string, color: THREE.Color): void {
+      for (const mat of builtModel.materialsByName.get(materialName) ?? []) {
+        mat.color.copy(color);
+      }
+    },
     resize,
     destroy(): void {
       orbitControls.dispose();
       renderer.dispose();
-      for (const material of builtModel.materials) { material.dispose(); }
+      for (const mats of builtModel.materialsByName.values()) {
+        for (const mat of mats) { mat.dispose(); }
+      }
     }
   };
 }

@@ -66,7 +66,9 @@ export function createGripperScene(
     destroy(): void {
       orbitControls.dispose();
       renderer.dispose();
-      for (const material of builtModel.materials) { material.dispose(); }
+      for (const mats of builtModel.materialsByName.values()) {
+        for (const mat of mats) { mat.dispose(); }
+      }
     }
   };
 }

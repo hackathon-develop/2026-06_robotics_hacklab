@@ -235,6 +235,51 @@ canvas {
   text-align: right;
 }
 
+.robot-viz-color-section {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid #dbe3ee;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.robot-viz-color-section strong {
+  font-size: 0.85rem;
+  color: #334155;
+}
+
+.robot-viz-color-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.robot-viz-color-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.robot-viz-color-row input[type="color"] {
+  width: 2rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  cursor: pointer;
+  background: none;
+}
+
+.robot-viz-color-readout {
+  font-size: 0.72rem;
+  font-family: ui-monospace, monospace;
+  color: #64748b;
+  user-select: all;
+}
+
 @media (width <= 800px) {
   .robot-viz-root {
     grid-template-columns: 1fr;
