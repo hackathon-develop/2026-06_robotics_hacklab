@@ -7,8 +7,8 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { loadMesh } from '../../mesh-loader';
 import {
   loadWebModel,
-  primitiveGeometry,
-  type WebGeometry
+  materialFor,
+  primitiveGeometry
 } from '../../web-model';
 
 export interface BodyTreeVisualization {
@@ -40,10 +40,6 @@ function requiredElement(root: ParentNode, selector: string): HTMLElement {
   const element = root.querySelector<HTMLElement>(selector);
   if (!element) { throw new Error(`Missing required element ${selector}`); }
   return element;
-}
-
-function isMotor(geometry: WebGeometry): boolean {
-  return geometry.rgba[0] < 0.5 && geometry.rgba[1] < 0.5 && geometry.rgba[2] < 0.5;
 }
 
 function setQuaternion(
@@ -111,8 +107,6 @@ export async function initializeBodyTreeVisualization(
   grid.rotation.x = Math.PI / 2;
   scene.add(grid);
 
-  const printed = new THREE.MeshStandardMaterial({ color: 0xffb000, roughness: 0.55 });
-  const motor = new THREE.MeshStandardMaterial({ color: 0x292d32, roughness: 0.7 });
   const selected = new THREE.MeshStandardMaterial({
     color: 0x38bdf8, emissive: 0x075985, roughness: 0.35
   });
@@ -129,8 +123,7 @@ export async function initializeBodyTreeVisualization(
   const select = (id: string, title: string, details: string, object: THREE.Object3D): void => {
     selectedId = id;
     for (const [meshId, mesh] of meshes) {
-      const visual = mesh.userData.visual as WebGeometry;
-      mesh.material = meshId === id ? selected : isMotor(visual) ? motor : printed;
+      mesh.material = meshId === id ? selected : mesh.userData.baseMaterial as THREE.Material;
     }
     for (const [rowId, row] of rows) { row.classList.toggle('selected', rowId === id); }
     info.innerHTML = `<strong>${title}</strong><span>${details}</span>`;
@@ -219,10 +212,12 @@ export async function initializeBodyTreeVisualization(
         bodyMetrics.set(link.name, total);
         requiredElement(row, 'small').textContent = metricsLabel(metrics);
         requiredElement(summary, 'small').textContent = metricsLabel(total);
-        const mesh = new THREE.Mesh(geometry, isMotor(visual) ? motor : printed);
+        const baseMaterial = materialFor(visual, model.materials);
+        const mesh = new THREE.Mesh(geometry, baseMaterial);
         mesh.position.set(...visual.position);
         setQuaternion(mesh, visual.quaternion);
         mesh.userData.visual = visual;
+        mesh.userData.baseMaterial = baseMaterial;
         group.add(mesh);
         meshes.set(id, mesh);
         mesh.visible = !hiddenBodies.has(link.name) && !hiddenMeshes.has(id);
@@ -255,9 +250,7 @@ export async function initializeBodyTreeVisualization(
       }
       row.addEventListener('click', () => {
         const mesh = meshes.get(id) ?? group;
-        const type = visual.type === 'mesh'
-          ? isMotor(visual) ? 'motor' : 'printed part'
-          : `${visual.type} primitive`;
+        const type = visual.type === 'mesh' ? 'mesh' : `${visual.type} primitive`;
         const metrics = meshMetrics.get(id);
         select(id, visualName, metrics
           ? `${type} · ${metricsLabel(metrics)} · ${formatCount(metrics.vertices)} vertices`
@@ -316,8 +309,9 @@ export async function initializeBodyTreeVisualization(
     observer.disconnect();
     controls.dispose();
     renderer.dispose();
-    printed.dispose();
-    motor.dispose();
+    for (const mesh of meshes.values()) {
+      (mesh.userData.baseMaterial as THREE.Material | undefined)?.dispose();
+    }
     selected.dispose();
     root.remove();
   } });

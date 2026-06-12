@@ -21,6 +21,7 @@ from pick_and_place.collision_boxes import (
     GRIP_SOLIMP,
     GRIP_SOLREF,
 )
+from pick_and_place.materials import MaterialConfig, apply_materials
 from pick_and_place.wrist_camera import add_wrist_camera
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -31,7 +32,11 @@ STOCK_ASSETS_DIR = STOCK_XML.parent / "assets"
 _COLLISION_RGBA = (0.2, 0.8, 0.2, 0.5)
 
 
-def build_robot(*, wrist_camera: bool = True) -> mujoco.MjSpec:
+def build_robot(
+    *,
+    wrist_camera: bool = True,
+    materials: MaterialConfig | None = None,
+) -> mujoco.MjSpec:
     """Stock SO-101 with box collisions; call ``.compile()`` on the result.
 
     The hex-nut wrist-camera mount and 32x32 UVC module are included by
@@ -43,6 +48,7 @@ def build_robot(*, wrist_camera: bool = True) -> mujoco.MjSpec:
     _add_collision_boxes(spec)
     if wrist_camera:
         add_wrist_camera(spec)
+    apply_materials(spec, materials or MaterialConfig())
     return spec
 
 

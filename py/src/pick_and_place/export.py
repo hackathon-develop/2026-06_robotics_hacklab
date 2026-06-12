@@ -22,6 +22,7 @@ from typing import Any
 import mujoco
 
 from pick_and_place.builder import STOCK_ASSETS_DIR, build_robot
+from pick_and_place.materials import MaterialConfig
 
 _GEOM_TYPES = {
     mujoco.mjtGeom.mjGEOM_SPHERE: "sphere",
@@ -43,7 +44,11 @@ def _values(values: Any) -> list[float]:
     return [float(value) for value in values]
 
 
-def web_manifest(spec: mujoco.MjSpec, model: mujoco.MjModel) -> dict[str, Any]:
+def web_manifest(
+    spec: mujoco.MjSpec,
+    model: mujoco.MjModel,
+    materials: MaterialConfig | None = None,
+) -> dict[str, Any]:
     """Return a web representation of a composed and compiled MuJoCo model.
 
     Body and geom poses come from ``spec`` because compiled mesh geom poses
@@ -70,13 +75,14 @@ def web_manifest(spec: mujoco.MjSpec, model: mujoco.MjModel) -> dict[str, Any]:
     for geom_id in range(model.ngeom):
         geom_type = mujoco.mjtGeom(int(model.geom_type[geom_id]))
         spec_geom = spec.geoms[geom_id]
+        mat_id = int(model.geom_matid[geom_id])
         geom: dict[str, Any] = {
             "name": model.geom(geom_id).name or f"geom_{geom_id}",
             "role": "visual" if int(model.geom_group[geom_id]) == 2 else "collision",
             "type": _GEOM_TYPES[geom_type],
             "position": _values(spec_geom.pos),
             "quaternion": _values(spec_geom.quat),
-            "rgba": _values(model.geom_rgba[geom_id]),
+            "material": model.mat(mat_id).name,
         }
         if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
             mesh_id = int(model.geom_dataid[geom_id])
@@ -107,12 +113,28 @@ def web_manifest(spec: mujoco.MjSpec, model: mujoco.MjModel) -> dict[str, Any]:
         }
         for camera_id in range(model.ncam)
     ]
-    return {"format": "pick-and-place-web-model", "version": 1, "bodies": bodies, "cameras": cameras}
+    materials_dict: dict[str, list[float]] = {
+        model.mat(mat_id).name: _values(model.mat_rgba[mat_id])
+        for mat_id in range(model.nmat)
+    }
+
+    return {
+        "format": "pick-and-place-web-model",
+        "version": 2,
+        "materials": materials_dict,
+        "bodies": bodies,
+        "cameras": cameras,
+    }
 
 
-def export_robot(output: Path, *, wrist_camera: bool = True) -> tuple[Path, Path]:
+def export_robot(
+    output: Path,
+    *,
+    wrist_camera: bool = True,
+    materials: MaterialConfig | None = None,
+) -> tuple[Path, Path]:
     """Write matching XML and JSON outputs from one composed robot."""
-    spec = build_robot(wrist_camera=wrist_camera)
+    spec = build_robot(wrist_camera=wrist_camera, materials=materials)
     # The spec was loaded relative to the stock model; rewrite meshdir so the
     # exported file resolves meshes from wherever it is saved.
     spec.meshdir = str(STOCK_ASSETS_DIR)
@@ -120,7 +142,9 @@ def export_robot(output: Path, *, wrist_camera: bool = True) -> tuple[Path, Path
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(spec.to_xml())
     manifest_output = output.with_suffix(".json")
-    manifest_output.write_text(json.dumps(web_manifest(spec, model), indent=2) + "\n")
+    manifest_output.write_text(
+        json.dumps(web_manifest(spec, model, materials), indent=2) + "\n"
+    )
     return output, manifest_output
 
 

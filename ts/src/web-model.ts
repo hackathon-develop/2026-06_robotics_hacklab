@@ -20,7 +20,7 @@ export interface WebGeometry {
   type: 'sphere' | 'capsule' | 'ellipsoid' | 'cylinder' | 'box' | 'mesh';
   position: [number, number, number];
   quaternion: [number, number, number, number];
-  rgba: [number, number, number, number];
+  material: string;
   mesh?: string;
   size?: [number, number, number];
 }
@@ -36,7 +36,8 @@ export interface WebBody {
 
 export interface WebModel {
   format: 'pick-and-place-web-model';
-  version: 1;
+  version: 2;
+  materials: Record<string, [number, number, number, number]>;
   bodies: WebBody[];
 }
 
@@ -67,8 +68,11 @@ function setQuaternion(
   object.quaternion.set(x, y, z, w);
 }
 
-function materialFor(geometry: WebGeometry): THREE.MeshStandardMaterial {
-  const [r, g, b, a] = geometry.rgba;
+export function materialFor(
+  geometry: WebGeometry,
+  modelMaterials: Record<string, [number, number, number, number]>
+): THREE.MeshStandardMaterial {
+  const [r, g, b, a] = modelMaterials[geometry.material] ?? [0.5, 0.5, 0.5, 1];
   return new THREE.MeshStandardMaterial({
     color: new THREE.Color(r, g, b),
     opacity: a,
@@ -176,7 +180,7 @@ export function buildWebModel(
 
     for (const geometry of body.geometries) {
       if (geometry.role !== 'visual') { continue; }
-      const material = materialFor(geometry);
+      const material = materialFor(geometry, model.materials);
       materials.push(material);
       if (geometry.type === 'mesh' && geometry.mesh !== undefined) {
         void loadMesh(`${basePath}/${geometry.mesh}`).then(({ geometry: bufferGeometry }) => {
