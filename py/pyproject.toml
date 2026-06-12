@@ -5,7 +5,6 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pick-and-place"
 version = "0.0.0"
-requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.0",
     "pymeshlab>=2023.12",
