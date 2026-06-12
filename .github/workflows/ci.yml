@@ -19,6 +19,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - uses: astral-sh/setup-uv@v5
       - name: "Install JS dependencies"
         working-directory: ts
@@ -26,20 +29,26 @@ jobs:
       - name: "Install script dependencies"
         working-directory: scripts
         run: pnpm i
-      - name: "Run ruff on simulation package"
-        working-directory: py
-        run: uv run ruff check .
-      - name: "Run simulation package tests"
-        working-directory: py
-        run: uv run pytest
-      - name: "Run ruff on mesh optimization package"
-        working-directory: mesh_optimization
-        run: uv run ruff check .
       - name: "Install mesh generation system dependencies"
         run: sudo apt-get update && sudo apt-get install -y libopengl0
+      - name: "Install simulation package dependencies"
+        working-directory: py
+        run: uv pip install --system -e . --group dev
+      - name: "Install mesh optimization package dependencies"
+        working-directory: mesh_optimization
+        run: uv pip install --system -e . --group dev
+      - name: "Run ruff on simulation package"
+        working-directory: py
+        run: python -m ruff check .
+      - name: "Run simulation package tests"
+        working-directory: py
+        run: python -m pytest
+      - name: "Run ruff on mesh optimization package"
+        working-directory: mesh_optimization
+        run: python -m ruff check .
       - name: "Generate meshes"
         working-directory: mesh_optimization
-        run: uv run python scripts/simplify_meshes.py
+        run: python scripts/simplify_meshes.py
       - name: "Optimize meshes"
         working-directory: ts
         run: pnpm run optimize-meshes

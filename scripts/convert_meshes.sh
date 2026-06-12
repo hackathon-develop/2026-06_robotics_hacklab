@@ -63,7 +63,7 @@ EXPORT_ARGS=()
 if [[ "$OMIT_WRIST_CAMERA_MOUNT" == true ]]; then
     EXPORT_ARGS+=(--no-wrist-camera)
 fi
-uv run python -m pick_and_place.export \
+python -m pick_and_place.export \
     -o "$PICK_AND_PLACE_DIR/ts/public/so101.xml" "${EXPORT_ARGS[@]}"
 rm -f "$PICK_AND_PLACE_DIR/ts/public/so101.xml"
 
