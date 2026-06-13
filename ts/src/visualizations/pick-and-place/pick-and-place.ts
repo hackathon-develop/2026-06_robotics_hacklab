@@ -17,7 +17,12 @@ import {
 import { createXyMultiDragControls } from '../xy-drag-controls';
 import { createCarryProfilePlot } from './carry-profile-plot';
 import { createPickAndPlaceScene } from './scene';
-import { computeTrajectory, NEUTRAL_FRAME, type Trajectory } from './trajectory';
+import {
+  computeTrajectory,
+  NEUTRAL_FRAME,
+  REST_FRAME,
+  type Trajectory
+} from './trajectory';
 import {
   buildUi,
   type PickAndPlaceCubeInputs
@@ -33,6 +38,9 @@ export interface PickAndPlaceOptions {
   initialJointPositions?: Readonly<Record<string, number>>;
   sourcePosition?: Readonly<{ x: number; y: number; yaw?: number }>;
   targetPosition?: Readonly<{ x: number; y: number; yaw?: number }>;
+  // Wrap the existing neutral-to-neutral motion with rest-to-neutral and
+  // neutral-to-rest phases.
+  startFromAndReturnToRestPose?: boolean;
 }
 
 const DEFAULT_SOURCE = { x: 0.2, y: -0.08, yaw: 0 };
@@ -246,10 +254,12 @@ export async function PickAndPlace(
     }
   };
   const resetFrame = (): void => {
+    const setupFrame =
+      options.startFromAndReturnToRestPose === true ? REST_FRAME : NEUTRAL_FRAME;
     for (const name of ARM_JOINT_NAMES) {
-      vizScene.setJoint(name, NEUTRAL_FRAME.joints[name]);
+      vizScene.setJoint(name, setupFrame.joints[name]);
     }
-    vizScene.setJoint('gripper', NEUTRAL_FRAME.gripper);
+    vizScene.setJoint('gripper', setupFrame.gripper);
     vizScene.updateSourceCube(sourcePose);
   };
 
@@ -291,10 +301,13 @@ export async function PickAndPlace(
         profilePlot.element.hidden = true;
       }
     } else {
-      trajectory = computeTrajectory(kinematics, sourcePose, targetPose);
+      trajectory = computeTrajectory(kinematics, sourcePose, targetPose, {
+        startFromAndReturnToRestPose: options.startFromAndReturnToRestPose
+      });
       if (trajectory === null) { setStage('setup'); return; }
       ui.seekInput.max = String(trajectory.duration);
       playbackSeconds = 0;
+      applyFrame(playbackSeconds);
       const profile = trajectory.carryProfile();
       for (const profilePlot of profilePlots) {
         profilePlot.setProfile(profile);
@@ -339,6 +352,7 @@ export async function PickAndPlace(
   });
   resizeObserver.observe(ui.viewport);
   renderCubePoses();
+  if (options.startFromAndReturnToRestPose === true) { resetFrame(); }
 
   let animationFrameId = 0;
   let destroyed = false;

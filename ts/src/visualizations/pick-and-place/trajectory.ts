@@ -58,6 +58,21 @@ export const NEUTRAL_FRAME: RobotPose = {
   gripper: 0
 };
 
+// The physical follower's safe sleeping pose, converted from calibrated
+// encoder degrees into the MuJoCo joint frame.
+export const REST_FRAME: RobotPose = {
+  joints: {
+    shoulder_pan: 5.492788249022637 * (Math.PI / 180),
+    shoulder_lift: -95.10455666443607 * (Math.PI / 180),
+    elbow_flex: 89.41623426698676 * (Math.PI / 180),
+    wrist_flex: 75.45878504436078 * (Math.PI / 180),
+    wrist_roll: -86.5807853208365 * (Math.PI / 180)
+  },
+  gripper: ((10 - 2.3) / 96.2 * 130 - 10) * (Math.PI / 180)
+};
+
+const REST_PHASE_DURATION = 2.0;
+
 // Duration of stage 1 – neutral → hover pregrasp above source cube.
 const STAGE1_DURATION = 2.0;
 // Duration of stage 2 – hover pregrasp → pregrasp at source cube center.
@@ -127,6 +142,67 @@ function lerpJoints(a: JointAngles, b: JointAngles, alpha: number): JointAngles 
   const out = {} as JointAngles;
   for (const name of ARM_JOINT_NAMES) {
     out[name] = a[name] + (b[name] - a[name]) * alpha;
+  }
+  return out;
+}
+
+function quinticBezier(
+  p0: number,
+  p1: number,
+  p2: number,
+  p3: number,
+  p4: number,
+  p5: number,
+  phase: number
+): number {
+  const t = Math.min(1, Math.max(0, phase));
+  const u = 1 - t;
+  return u ** 5 * p0 +
+    5 * u ** 4 * t * p1 +
+    10 * u ** 3 * t ** 2 * p2 +
+    10 * u ** 2 * t ** 3 * p3 +
+    5 * u * t ** 4 * p4 +
+    t ** 5 * p5;
+}
+
+// One smooth rest-to-hover movement. Neutral steers the curve but is not
+// visited; duplicated endpoints make the arm start and finish at rest.
+function restToHoverJoints(
+  hover: JointAngles,
+  phase: number
+): JointAngles {
+  const out = {} as JointAngles;
+  for (const name of ARM_JOINT_NAMES) {
+    out[name] = quinticBezier(
+      REST_FRAME.joints[name],
+      REST_FRAME.joints[name],
+      NEUTRAL_FRAME.joints[name],
+      NEUTRAL_FRAME.joints[name],
+      hover[name],
+      hover[name],
+      phase
+    );
+  }
+  return out;
+}
+
+// Mirror the opening movement after the drop: leave hover, bend toward neutral
+// without visiting it, and settle at rest.
+function hoverToRestJoints(
+  hover: JointAngles,
+  phase: number
+): JointAngles {
+  const out = {} as JointAngles;
+  for (const name of ARM_JOINT_NAMES) {
+    out[name] = quinticBezier(
+      hover[name],
+      hover[name],
+      NEUTRAL_FRAME.joints[name],
+      NEUTRAL_FRAME.joints[name],
+      REST_FRAME.joints[name],
+      REST_FRAME.joints[name],
+      phase
+    );
   }
   return out;
 }
@@ -503,10 +579,15 @@ export interface Trajectory {
   carryFraction(t: number): number | null;
 }
 
+export interface TrajectoryOptions {
+  startFromAndReturnToRestPose?: boolean;
+}
+
 export function computeTrajectory(
   k: So101Kinematics,
   sourcePose: CubePose,
-  targetPose: CubePose
+  targetPose: CubePose,
+  options: TrajectoryOptions = {}
 ): Trajectory | null {
   // The gripper never lets go between the grasp and the drop, so the cube
   // arrives at the target in an orientation that is fully determined by which
@@ -597,7 +678,15 @@ export function computeTrajectory(
   const stage2End = STAGE1_DURATION + STAGE2_DURATION;
   const stage3End = stage2End + STAGE3_DURATION;
   const stage4End = stage3End + STAGE4_DURATION;
-  const duration = stage4End + STAGE5_DURATION;
+  const coreDuration = stage4End + STAGE5_DURATION;
+  const startFromAndReturnToRestPose =
+    options.startFromAndReturnToRestPose ?? false;
+  const startOffset = startFromAndReturnToRestPose ? REST_PHASE_DURATION : 0;
+  const restToHoverDuration = startOffset + STAGE1_DURATION;
+  const postdropHoverTime = stage4End + POSTDROP_HOVER_DURATION;
+  const hoverToRestDuration = RETURN_TO_NEUTRAL_DURATION + REST_PHASE_DURATION;
+  const duration = coreDuration + startOffset +
+    (startFromAndReturnToRestPose ? REST_PHASE_DURATION : 0);
   const releaseOpeningFraction =
     RELEASE_OPENING_ANGLE / (GRIPPER_OPEN - GRIPPER_CLOSED);
   const movementOpeningFraction =
@@ -619,6 +708,41 @@ export function computeTrajectory(
   return {
     duration,
     evaluate(t: number): TrajectoryFrame {
+      if (startFromAndReturnToRestPose && t <= restToHoverDuration) {
+        const phase = t / restToHoverDuration;
+        return {
+          joints: restToHoverJoints(stage1EndJoints, phase),
+          gripper: quinticBezier(
+            REST_FRAME.gripper,
+            REST_FRAME.gripper,
+            NEUTRAL_FRAME.gripper,
+            NEUTRAL_FRAME.gripper,
+            GRIPPER_OPEN,
+            GRIPPER_OPEN,
+            phase
+          ),
+          sourceCube: sourcePose
+        };
+      }
+      const coreTime = t - startOffset;
+      if (startFromAndReturnToRestPose && coreTime >= postdropHoverTime) {
+        const phase =
+          (coreTime - postdropHoverTime) / hoverToRestDuration;
+        return {
+          joints: hoverToRestJoints(stage5EndJoints, phase),
+          gripper: quinticBezier(
+            GRIPPER_OPEN,
+            GRIPPER_OPEN,
+            NEUTRAL_FRAME.gripper,
+            NEUTRAL_FRAME.gripper,
+            REST_FRAME.gripper,
+            REST_FRAME.gripper,
+            phase
+          ),
+          sourceCube: targetPose
+        };
+      }
+      t = coreTime;
       if (t >= stage4End) {
         // Stage 5: wait until the released cube clears the jaws, then follow a
         // single C2 joint spline through hover and directly back to neutral.
@@ -748,6 +872,7 @@ export function computeTrajectory(
       return points;
     },
     carryFraction(t: number): number | null {
+      t -= startOffset;
       if (t < stage3End) { return null; }
       return Math.min(1, (t - stage3End) / STAGE4_DURATION);
     }

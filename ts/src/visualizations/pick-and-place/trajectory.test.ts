@@ -10,7 +10,7 @@ import type * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 
 import { bodyWorldTransform } from '../../ik/fk';
-import { deriveSo101Kinematics } from '../../ik/kinematics';
+import { ARM_JOINT_NAMES, deriveSo101Kinematics } from '../../ik/kinematics';
 import {
   anyYawCubeCenterBand,
   computeSimpleWorkspaceForCubeZ,
@@ -26,7 +26,8 @@ import {
   computeTrajectory,
   GRIPPER_CLOSED,
   GRIPPER_OPEN,
-  NEUTRAL_FRAME
+  NEUTRAL_FRAME,
+  REST_FRAME
 } from './trajectory';
 
 const model = JSON.parse(
@@ -47,6 +48,58 @@ function gripperTarget(joints: Record<string, number>): THREE.Vector3 {
 }
 
 describe('pick-and-place trajectory', () => {
+  it('optionally curves between rest and each hover using neutral directionally', () => {
+    const trajectory = computeTrajectory(kinematics, sourcePose, targetPose, {
+      startFromAndReturnToRestPose: true
+    });
+    if (!trajectory) { throw new Error('expected source pose to be reachable'); }
+    const defaultTrajectory = computeTrajectory(kinematics, sourcePose, targetPose);
+    if (!defaultTrajectory) { throw new Error('expected source pose to be reachable'); }
+
+    expect(trajectory.duration).toBe(13.5);
+    expect(trajectory.evaluate(0)).toEqual({
+      ...REST_FRAME,
+      sourceCube: sourcePose
+    });
+    expect(trajectory.evaluate(2).joints).not.toEqual(NEUTRAL_FRAME.joints);
+    expect(trajectory.evaluate(4)).toEqual(defaultTrajectory.evaluate(2));
+    expect(trajectory.evaluate(5)).toEqual(defaultTrajectory.evaluate(3));
+    const postdropHover = trajectory.evaluate(9.5);
+    const defaultPostdropHover = defaultTrajectory.evaluate(7.5);
+    for (const name of ARM_JOINT_NAMES) {
+      expect(postdropHover.joints[name]).toBeCloseTo(
+        defaultPostdropHover.joints[name]
+      );
+    }
+    expect(postdropHover.gripper).toBeCloseTo(defaultPostdropHover.gripper);
+    expect(postdropHover.sourceCube).toEqual(defaultPostdropHover.sourceCube);
+    expect(trajectory.evaluate(11.5).joints).not.toEqual(NEUTRAL_FRAME.joints);
+    expect(trajectory.evaluate(trajectory.duration)).toEqual({
+      ...REST_FRAME,
+      sourceCube: targetPose
+    });
+    expect(trajectory.carryFraction(6)).toBe(0);
+    expect(trajectory.carryFraction(8)).toBe(1);
+    expect(trajectory.carryFraction(10)).toBe(1);
+
+    // Neutral is only a directional control point, never a visited pose.
+    const neutralDistance = (joints: Record<string, number>): number =>
+      Math.hypot(...Object.keys(NEUTRAL_FRAME.joints).map(
+        name => joints[name] - NEUTRAL_FRAME.joints[name as keyof typeof NEUTRAL_FRAME.joints]
+      ));
+    for (let t = 0.05; t < 4; t += 0.05) {
+      expect(neutralDistance(trajectory.evaluate(t).joints)).toBeGreaterThan(1e-6);
+    }
+    for (let t = 9.55; t < trajectory.duration; t += 0.05) {
+      expect(neutralDistance(trajectory.evaluate(t).joints)).toBeGreaterThan(1e-6);
+    }
+
+    // The original hover-to-pregrasp descent remains unchanged after handoff.
+    expect(trajectory.evaluate(4.5)).toEqual(defaultTrajectory.evaluate(2.5));
+    // Release and retreat to the post-drop hover also remain unchanged.
+    expect(trajectory.evaluate(9)).toEqual(defaultTrajectory.evaluate(7));
+  });
+
   it('lowers vertically from hover to pregrasp while keeping the gripper open', () => {
     const trajectory = computeTrajectory(kinematics, sourcePose, targetPose);
     if (!trajectory) { throw new Error('expected source pose to be reachable'); }

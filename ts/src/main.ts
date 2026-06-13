@@ -98,7 +98,9 @@ function initialize(): void {
     pickAndPlaceVisualization?.destroy();
     pickAndPlaceVisualization = null;
 
-    void PickAndPlace(pickAndPlacePanel).then(viz => {
+    void PickAndPlace(pickAndPlacePanel, {
+      startFromAndReturnToRestPose: true
+    }).then(viz => {
       pickAndPlaceVisualization = viz;
     });
   }
