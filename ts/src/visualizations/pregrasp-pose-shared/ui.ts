@@ -4,11 +4,32 @@
 import type * as THREE from 'three';
 
 import type { TransformStage } from './bodies';
+import type { CubeFace } from './body-factories';
 
 export const CANVAS_WIDTH = 600;
 export const CANVAS_HEIGHT = 300;
+export const DEGREE_SLIDER_STEPS = 360;
 
 export const FLOOR_FACES: ReadonlySet<string> = new Set(['+x', '-x', '+y', '-y']);
+export const SIDE_FACES: readonly CubeFace[] = ['+x', '-x', '+y', '-y'];
+
+const FACE_LABELS: Record<CubeFace, string> = {
+  '+x': '+X',
+  '-x': '−X',
+  '+y': '+Y',
+  '-y': '−Y',
+  '+z': '+Z',
+  '-z': '−Z'
+};
+
+export interface CubePoseInputs {
+  xInput: HTMLInputElement;
+  yInput: HTMLInputElement;
+  zInput: HTMLInputElement;
+  yawInput: HTMLInputElement;
+  pitchInput: HTMLInputElement;
+  rollInput: HTMLInputElement;
+}
 
 export interface PregraspPosePane {
   bodySelection: 'combined' | 'cube' | 'gripper';
@@ -50,6 +71,94 @@ export function appendSliderGroup(
   return input;
 }
 
+export function appendDegreeSliderGroup(
+  parent: HTMLElement,
+  label: string,
+  min: number,
+  max: number,
+  value: number
+): HTMLInputElement {
+  const input = appendSliderGroup(parent, label, min, max, value, 1, '°');
+  setDegreeSliderRange(input, min, max);
+  return input;
+}
+
+export function setDegreeSliderRange(
+  input: HTMLInputElement,
+  min: number,
+  max: number
+): void {
+  input.min = String(min);
+  input.max = String(max);
+  input.step = String((max - min) / DEGREE_SLIDER_STEPS);
+}
+
+export function appendFloorModeInput(parent: HTMLElement): HTMLInputElement {
+  const group = document.createElement('div');
+  group.className = 'pregrasp-pose-breakdown-viz-controls-group';
+  const label = document.createElement('label');
+  label.className = 'pregrasp-pose-breakdown-viz-floor-label';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = true;
+  const text = document.createElement('span');
+  text.textContent = 'On floor';
+  label.append(input, text);
+  group.appendChild(label);
+  parent.appendChild(group);
+  return input;
+}
+
+export function appendFaceInputs(
+  parent: HTMLElement,
+  name: string,
+  faces: readonly CubeFace[] = [
+    '+x', '-x', '+y', '-y', '+z', '-z'
+  ],
+  enabledFaces?: ReadonlySet<string>
+): HTMLInputElement[] {
+  const group = document.createElement('div');
+  group.className = 'pregrasp-pose-breakdown-viz-controls-group';
+  const groupLabel = document.createElement('span');
+  groupLabel.textContent = 'Face';
+  const options = document.createElement('div');
+  options.className = 'pregrasp-pose-breakdown-viz-face-options';
+  const inputs = faces.map((face, index) => {
+    const wrapper = document.createElement('label');
+    wrapper.className = 'pregrasp-pose-breakdown-viz-face-option';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = name;
+    input.value = face;
+    input.checked = index === 0;
+    input.disabled = enabledFaces !== undefined && !enabledFaces.has(face);
+    const label = document.createElement('span');
+    label.textContent = FACE_LABELS[face];
+    wrapper.append(input, label);
+    options.appendChild(wrapper);
+    return input;
+  });
+  group.append(groupLabel, options);
+  parent.appendChild(group);
+  return inputs;
+}
+
+export function appendCubePoseInputs(
+  parent: HTMLElement,
+  onFloor = false
+): CubePoseInputs {
+  const xInput = appendSliderGroup(parent, 'X', -100, 100, 0, 1);
+  const yInput = appendSliderGroup(parent, 'Y', -100, 100, 0, 1);
+  const zInput = appendSliderGroup(parent, 'Z', 0, 300, 15, 1);
+  const yawInput = appendDegreeSliderGroup(parent, 'Yaw', -180, 180, 0);
+  const pitchInput = appendDegreeSliderGroup(parent, 'Pitch', -180, 180, 0);
+  const rollInput = appendDegreeSliderGroup(parent, 'Roll', -180, 180, 0);
+  zInput.disabled = onFloor;
+  pitchInput.disabled = onFloor;
+  rollInput.disabled = onFloor;
+  return { xInput, yInput, zInput, yawInput, pitchInput, rollInput };
+}
+
 export function createPane(
   title: string,
   bodySelection: PregraspPosePane['bodySelection'],
@@ -73,8 +182,7 @@ export function createPane(
     hingeInput = document.createElement('input');
     hingeInput.className = 'pregrasp-pose-breakdown-viz-hinge-input';
     hingeInput.type = 'range';
-    hingeInput.min = '0';
-    hingeInput.max = '360';
+    setDegreeSliderRange(hingeInput, 0, 360);
     hingeInput.value = '0';
     hingeInput.addEventListener('input', () => {
       output.textContent = `${hingeInput?.value ?? 0}°`;

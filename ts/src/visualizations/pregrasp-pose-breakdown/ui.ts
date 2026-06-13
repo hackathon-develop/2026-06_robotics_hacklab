@@ -5,7 +5,9 @@ import type * as THREE from 'three';
 
 import type { CubeFace } from '../pregrasp-pose-shared/bodies';
 import {
-  appendSliderGroup,
+  appendCubePoseInputs,
+  appendFaceInputs,
+  appendFloorModeInput,
   createPane,
   FLOOR_FACES,
   formatTranslation,
@@ -35,10 +37,6 @@ export interface PregraspPoseBreakdownDom {
   rollInput: HTMLInputElement;
 }
 
-const FACE_OPTIONS = [
-  ['+x', '+X'], ['-x', '−X'], ['+y', '+Y'], ['-y', '−Y'], ['+z', '+Z'], ['-z', '−Z']
-] as const;
-
 export function buildUi(parent: HTMLElement): PregraspPoseBreakdownDom {
   const root = document.createElement('div');
   root.className = 'visualization pregrasp-pose-breakdown-viz-root';
@@ -46,53 +44,13 @@ export function buildUi(parent: HTMLElement): PregraspPoseBreakdownDom {
   const controls = document.createElement('div');
   controls.className = 'pregrasp-pose-breakdown-viz-controls';
 
-  const floorGroup = document.createElement('div');
-  floorGroup.className = 'pregrasp-pose-breakdown-viz-controls-group';
-  const floorLabel = document.createElement('label');
-  floorLabel.className = 'pregrasp-pose-breakdown-viz-floor-label';
-  const floorModeInput = document.createElement('input');
-  floorModeInput.type = 'checkbox';
-  floorModeInput.checked = true;
-  const floorSpan = document.createElement('span');
-  floorSpan.textContent = 'On floor';
-  floorLabel.append(floorModeInput, floorSpan);
-  floorGroup.appendChild(floorLabel);
-  controls.appendChild(floorGroup);
-
-  const faceGroup = document.createElement('div');
-  faceGroup.className = 'pregrasp-pose-breakdown-viz-controls-group';
-  const faceGroupLabel = document.createElement('span');
-  faceGroupLabel.textContent = 'Face';
-  const faceOptions = document.createElement('div');
-  faceOptions.className = 'pregrasp-pose-breakdown-viz-face-options';
-  const faceInputs: HTMLInputElement[] = [];
-  for (const [value, label] of FACE_OPTIONS) {
-    const wrapper = document.createElement('label');
-    wrapper.className = 'pregrasp-pose-breakdown-viz-face-option';
-    const input = document.createElement('input');
-    input.type = 'radio';
-    input.name = 'cube-face';
-    input.value = value;
-    if (value === '+x') {input.checked = true;}
-    if (!FLOOR_FACES.has(value)) {input.disabled = true;}
-    faceInputs.push(input);
-    const span = document.createElement('span');
-    span.textContent = label;
-    wrapper.append(input, span);
-    faceOptions.appendChild(wrapper);
-  }
-  faceGroup.append(faceGroupLabel, faceOptions);
-  controls.appendChild(faceGroup);
-
-  const xInput = appendSliderGroup(controls, 'X', -100, 100, 0, 1);
-  const yInput = appendSliderGroup(controls, 'Y', -100, 100, 0, 1);
-  const zInput = appendSliderGroup(controls, 'Z', 0, 300, 15, 1);
-  zInput.disabled = true;
-  const yawInput = appendSliderGroup(controls, 'Yaw', -180, 180, 0, 1, '°');
-  const pitchInput = appendSliderGroup(controls, 'Pitch', -180, 180, 0, 1, '°');
-  pitchInput.disabled = true;
-  const rollInput = appendSliderGroup(controls, 'Roll', -180, 180, 0, 1, '°');
-  rollInput.disabled = true;
+  const floorModeInput = appendFloorModeInput(controls);
+  const faceInputs = appendFaceInputs(
+    controls, 'pregrasp-pose-breakdown-cube-face', undefined, FLOOR_FACES
+  );
+  const {
+    xInput, yInput, zInput, yawInput, pitchInput, rollInput
+  } = appendCubePoseInputs(controls, true);
 
   root.appendChild(controls);
 

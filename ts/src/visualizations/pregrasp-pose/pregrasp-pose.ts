@@ -9,7 +9,10 @@ import {
 } from '../pregrasp-pose-shared/bodies';
 import { DEFAULT_CUBE_POSE } from '../pregrasp-pose-shared/body-factories';
 import { createPregraspPoseScene } from '../pregrasp-pose-shared/scene';
-import { displayMatrix } from '../pregrasp-pose-shared/ui';
+import {
+  displayMatrix,
+  setDegreeSliderRange
+} from '../pregrasp-pose-shared/ui';
 import { buildUi, FLOOR_FACES } from './ui';
 
 export interface PregraspPoseVisualization {
@@ -110,13 +113,11 @@ export async function initializePregraspPoseVisualization(
     ui.pitchInput.disabled = onFloor;
     ui.rollInput.disabled = onFloor;
     if (onFloor) {
-      ui.hingeInput.min = '10';
-      ui.hingeInput.max = '135';
+      setDegreeSliderRange(ui.hingeInput, 10, 135);
       if (Number(ui.hingeInput.value) < 10) {ui.hingeInput.value = '10';}
       if (Number(ui.hingeInput.value) > 135) {ui.hingeInput.value = '135';}
     } else {
-      ui.hingeInput.min = '0';
-      ui.hingeInput.max = '360';
+      setDegreeSliderRange(ui.hingeInput, 0, 360);
     }
     ui.hingeInput.dispatchEvent(new Event('input'));
     if (onFloor) {

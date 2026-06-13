@@ -61,12 +61,7 @@ export async function createPregraspPoseScene(
   );
   scene.add(bodies.root);
 
-  const bounds = new THREE.Box3().setFromObject(bodies.root);
-  const center = bounds.getCenter(new THREE.Vector3());
-  const size = Math.max(bounds.getSize(new THREE.Vector3()).length(), 0.05);
-  orbitControls.target.copy(center);
-  camera.position.copy(center).add(new THREE.Vector3(size, size, size * 0.75));
-  orbitControls.update();
+  framePregraspPoseScene({ camera, orbitControls, bodies });
 
   return {
     scene,
@@ -80,4 +75,17 @@ export async function createPregraspPoseScene(
       bodies.destroy();
     }
   };
+}
+
+export function framePregraspPoseScene(
+  { camera, orbitControls, bodies }: Pick<
+    PregraspPoseScene, 'camera' | 'orbitControls' | 'bodies'
+  >
+): void {
+  const bounds = new THREE.Box3().setFromObject(bodies.root);
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = Math.max(bounds.getSize(new THREE.Vector3()).length(), 0.05);
+  orbitControls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(size, size, size * 0.75));
+  orbitControls.update();
 }

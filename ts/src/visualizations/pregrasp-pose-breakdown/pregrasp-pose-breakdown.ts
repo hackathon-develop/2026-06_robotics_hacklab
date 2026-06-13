@@ -18,7 +18,11 @@ import {
   DEFAULT_CUBE_POSE
 } from '../pregrasp-pose-shared/body-factories';
 import { createPregraspPoseScene } from '../pregrasp-pose-shared/scene';
-import { displayMatrix, FLOOR_FACES } from '../pregrasp-pose-shared/ui';
+import {
+  displayMatrix,
+  FLOOR_FACES,
+  setDegreeSliderRange
+} from '../pregrasp-pose-shared/ui';
 import {
   buildUi,
   displayCubeContactMatrix,
@@ -255,8 +259,7 @@ export async function initializePregraspPoseBreakdownVisualization(
     ui.rollInput.disabled = onFloor;
     if (hingePane.hingeInput) {
       if (onFloor) {
-        hingePane.hingeInput.min = '10';
-        hingePane.hingeInput.max = '135';
+        setDegreeSliderRange(hingePane.hingeInput, 10, 135);
         if (Number(hingePane.hingeInput.value) < 10) {
           hingePane.hingeInput.value = '10';
         }
@@ -264,8 +267,7 @@ export async function initializePregraspPoseBreakdownVisualization(
           hingePane.hingeInput.value = '135';
         }
       } else {
-        hingePane.hingeInput.min = '0';
-        hingePane.hingeInput.max = '360';
+        setDegreeSliderRange(hingePane.hingeInput, 0, 360);
       }
       hingePane.hingeInput.dispatchEvent(new Event('input'));
     }
