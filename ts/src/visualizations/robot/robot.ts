@@ -3,7 +3,7 @@
 
 import * as THREE from 'three';
 
-import { deriveSo101Kinematics } from '../../ik/kinematics';
+import { deriveSo101Kinematics, NEUTRAL_ARM_JOINTS } from '../../ik/kinematics';
 import { loadWebModel } from '../../web-model';
 import { buildWorkspaceOverlaySpecs } from '../workspace-overlay';
 import { createRobotScene } from './scene';
@@ -23,6 +23,7 @@ export async function initializeRobotVisualization(
   options: RobotVisualizationOptions = {}
 ): Promise<RobotVisualization> {
   const model = await loadWebModel(options.modelUrl);
+  const neutralJointValues: Partial<Record<string, number>> = NEUTRAL_ARM_JOINTS;
   const joints = model.bodies.flatMap(body => body.joints).flatMap(joint => {
     if (joint.type !== 'hinge' || joint.range === undefined) { return []; }
     return [{
@@ -30,7 +31,7 @@ export async function initializeRobotVisualization(
       label: joint.name.replaceAll('_', ' '),
       lower: joint.range[0],
       upper: joint.range[1],
-      value: 0
+      value: neutralJointValues[joint.name] ?? 0
     }];
   });
 
@@ -86,6 +87,7 @@ export async function initializeRobotVisualization(
   };
   ui.resetButton.addEventListener('click', reset);
   listeners.push(() => { ui.resetButton.removeEventListener('click', reset); });
+  reset();
 
   const resizeObserver = new ResizeObserver(() => { vizScene.resize(); });
   resizeObserver.observe(ui.viewport);

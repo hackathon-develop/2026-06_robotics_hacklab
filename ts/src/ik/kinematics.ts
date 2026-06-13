@@ -19,6 +19,14 @@ export const ARM_JOINT_NAMES = [
 
 export type ArmJointName = typeof ARM_JOINT_NAMES[number];
 
+export const NEUTRAL_ARM_JOINTS: Record<ArmJointName, number> = {
+  shoulder_pan: 0,
+  shoulder_lift: 0,
+  elbow_flex: 0,
+  wrist_flex: 0,
+  wrist_roll: -Math.PI / 2
+};
+
 // A link of the planar arm, expressed in the radial–height plane that the
 // closed-form IK solves in. `radial` runs outward from the pan axis, `height`
 // is world z; the link's constant out-of-plane (lateral) offset is dropped, so

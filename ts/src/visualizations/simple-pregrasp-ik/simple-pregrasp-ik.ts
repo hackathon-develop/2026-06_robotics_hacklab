@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Mario Gemoll
 // SPDX-License-Identifier: 0BSD
 
-import { ARM_JOINT_NAMES, deriveSo101Kinematics } from '../../ik/kinematics';
+import {
+  ARM_JOINT_NAMES,
+  deriveSo101Kinematics,
+  NEUTRAL_ARM_JOINTS
+} from '../../ik/kinematics';
 import {
   type SimpleIkBranch,
   type SimpleIkResult,
@@ -112,7 +116,9 @@ export async function initializeSimplePregraspIkVisualization(
   }
 
   function restToNeutral(): void {
-    for (const name of ARM_JOINT_NAMES) { vizScene.setJoint(name, 0); }
+    for (const name of ARM_JOINT_NAMES) {
+      vizScene.setJoint(name, NEUTRAL_ARM_JOINTS[name]);
+    }
   }
 
   function renderBranches(branches: SimpleIkBranch[]): void {

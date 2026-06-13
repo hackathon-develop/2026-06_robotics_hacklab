@@ -6,6 +6,7 @@ import * as THREE from 'three';
 import {
   ARM_JOINT_NAMES,
   type ArmJointName,
+  NEUTRAL_ARM_JOINTS,
   type So101Kinematics
 } from '../../ik/kinematics';
 import { solveSimplePregraspIk } from '../../ik/simple-ik';
@@ -53,13 +54,7 @@ export interface TrajectoryFrame extends RobotPose {
 }
 
 export const NEUTRAL_FRAME: RobotPose = {
-  joints: {
-    shoulder_pan: 0,
-    shoulder_lift: 0,
-    elbow_flex: 0,
-    wrist_flex: 0,
-    wrist_roll: 0
-  },
+  joints: NEUTRAL_ARM_JOINTS,
   gripper: 0
 };
 
