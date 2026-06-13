@@ -21,6 +21,16 @@ import { CANVAS_HEIGHT, CANVAS_WIDTH } from '../pregrasp-pose-shared/ui';
 // visualizations use, so the rendered gripper matches the grasp geometry.
 const GRIPPER_OPEN_ANGLE = Math.PI / 3;
 
+// Annular sector (on the ground) marking where a cube center is graspable for
+// any yaw. Built from the closed-form workspace; see src/ik/workspace.ts.
+export interface WorkspaceOverlaySpec {
+  center: THREE.Vector2;
+  innerRadius: number;
+  outerRadius: number;
+  thetaStart: number;
+  thetaLength: number;
+}
+
 export interface SimplePregraspIkScene {
   scene: THREE.Scene;
   renderer: THREE.WebGLRenderer;
@@ -35,7 +45,8 @@ export interface SimplePregraspIkScene {
 export function createSimplePregraspIkScene(
   viewport: HTMLElement,
   model: WebModel,
-  modelBasePath = '/so101_assets'
+  modelBasePath = '/so101_assets',
+  workspace?: WorkspaceOverlaySpec
 ): SimplePregraspIkScene {
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
@@ -66,6 +77,28 @@ export function createSimplePregraspIkScene(
   grid.position.set(0.2, 0, 0);
   scene.add(grid);
   scene.add(new THREE.AxesHelper(0.05));
+
+  // Ground overlay marking the any-yaw graspable cube-center region.
+  let workspaceGeometry: THREE.RingGeometry | undefined;
+  let workspaceMaterial: THREE.MeshBasicMaterial | undefined;
+  if (workspace) {
+    workspaceGeometry = new THREE.RingGeometry(
+      workspace.innerRadius, workspace.outerRadius, 96, 1,
+      workspace.thetaStart, workspace.thetaLength
+    );
+    workspaceMaterial = new THREE.MeshBasicMaterial({
+      color: 0x2fa84f,
+      transparent: true,
+      opacity: 0.22,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    });
+    const workspaceMesh = new THREE.Mesh(workspaceGeometry, workspaceMaterial);
+    // RingGeometry lies in the XY plane; lift slightly to avoid z-fighting.
+    workspaceMesh.position.set(workspace.center.x, workspace.center.y, 0.0006);
+    workspaceMesh.renderOrder = -1;
+    scene.add(workspaceMesh);
+  }
 
   const builtModel = buildWebModel(model, modelBasePath);
   scene.add(builtModel.root);
@@ -106,6 +139,8 @@ export function createSimplePregraspIkScene(
       }
       cubePart.destroy();
       materials.destroy();
+      workspaceGeometry?.dispose();
+      workspaceMaterial?.dispose();
     }
   };
 }

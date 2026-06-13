@@ -7,6 +7,11 @@ import {
   type SimpleIkResult,
   solveSimplePregraspIk
 } from '../../ik/simple-ik';
+import {
+  anyYawCubeCenterBand,
+  computeSimpleWorkspace,
+  sectorBoundingBox
+} from '../../ik/workspace';
 import { loadWebModel } from '../../web-model';
 import {
   type CubeFace,
@@ -40,9 +45,60 @@ export async function initializeSimplePregraspIkVisualization(
 ): Promise<SimplePregraspIkVisualization> {
   const model = await loadWebModel(options.modelUrl);
   const kinematics = deriveSo101Kinematics(model);
-  const ui = buildUi(parent);
+
+  // Closed-form any-yaw workspace: marks the graspable region and bounds the
+  // X/Y sliders to it. See src/ik/workspace.ts.
+  const workspace = computeSimpleWorkspace(kinematics);
+  const band = anyYawCubeCenterBand(workspace);
+  const bbox = sectorBoundingBox(workspace);
+  const panX = workspace.panAxis.x;
+  const panY = workspace.panAxis.y;
+  // Radial coordinates are measured from the pan axis (the sector's center).
+  const radialFromCartesian = (x: number, y: number): {
+    radiusMm: number; azimuthDeg: number;
+  } => ({
+    radiusMm: Math.hypot(x - panX, y - panY) * 1000,
+    azimuthDeg: (Math.atan2(y - panY, x - panX) * 180) / Math.PI
+  });
+  const cartesianFromRadial = (radiusMm: number, azimuthDeg: number): {
+    x: number; y: number;
+  } => {
+    const radius = radiusMm / 1000;
+    const azimuth = (azimuthDeg * Math.PI) / 180;
+    return {
+      x: panX + radius * Math.cos(azimuth),
+      y: panY + radius * Math.sin(azimuth)
+    };
+  };
+  const defaultRadial = radialFromCartesian(DEFAULT_IK_CUBE_X, DEFAULT_IK_CUBE_Y);
+  const ui = buildUi(parent, {
+    xRange: {
+      min: Math.floor(bbox.x.min * 1000),
+      max: Math.ceil(bbox.x.max * 1000)
+    },
+    yRange: {
+      min: Math.floor(bbox.y.min * 1000),
+      max: Math.ceil(bbox.y.max * 1000)
+    },
+    radiusRange: {
+      min: Math.floor(band.min * 1000),
+      max: Math.ceil(band.max * 1000)
+    },
+    azimuthRange: {
+      min: Math.ceil((workspace.azimuth.min * 180) / Math.PI),
+      max: Math.floor((workspace.azimuth.max * 180) / Math.PI)
+    },
+    radiusDefault: Math.round(defaultRadial.radiusMm),
+    azimuthDefault: Math.round(defaultRadial.azimuthDeg)
+  });
   const vizScene = createSimplePregraspIkScene(
-    ui.viewport, model, options.modelBasePath
+    ui.viewport, model, options.modelBasePath, {
+      center: workspace.panAxis,
+      innerRadius: band.min,
+      outerRadius: band.max,
+      thetaStart: workspace.azimuth.min,
+      thetaLength: workspace.azimuth.max - workspace.azimuth.min
+    }
   );
 
   let currentFace: CubeFace = '-x';
@@ -130,8 +186,6 @@ export async function initializeSimplePregraspIkVisualization(
   });
 
   const poseInputs = [
-    [ui.xInput, 'x', 1 / 1000],
-    [ui.yInput, 'y', 1 / 1000],
     [ui.zInput, 'z', 1 / 1000],
     [ui.yawInput, 'yaw', Math.PI / 180],
     [ui.pitchInput, 'pitch', Math.PI / 180],
@@ -146,6 +200,54 @@ export async function initializeSimplePregraspIkVisualization(
     return listener;
   });
 
+  // X/Y and radius/azimuth drive the same cube center; keep both in sync so a
+  // mode switch is seamless. The guard stops the programmatic value updates
+  // (which fire 'input' to refresh the slider labels) from recursing.
+  let syncing = false;
+  const setSlider = (input: HTMLInputElement, value: number): void => {
+    input.value = String(value);
+    input.dispatchEvent(new Event('input'));
+  };
+  const applyCartesian = (): void => {
+    if (syncing) { return; }
+    const x = Number(ui.xInput.value) / 1000;
+    const y = Number(ui.yInput.value) / 1000;
+    currentPose = { ...currentPose, x, y };
+    const radial = radialFromCartesian(x, y);
+    syncing = true;
+    setSlider(ui.radiusInput, Math.round(radial.radiusMm));
+    setSlider(ui.azimuthInput, Math.round(radial.azimuthDeg * 10) / 10);
+    syncing = false;
+    updateScene();
+  };
+  const applyRadial = (): void => {
+    if (syncing) { return; }
+    const { x, y } = cartesianFromRadial(
+      Number(ui.radiusInput.value), Number(ui.azimuthInput.value)
+    );
+    currentPose = { ...currentPose, x, y };
+    syncing = true;
+    setSlider(ui.xInput, Math.round(x * 1000));
+    setSlider(ui.yInput, Math.round(y * 1000));
+    syncing = false;
+    updateScene();
+  };
+  ui.xInput.addEventListener('input', applyCartesian);
+  ui.yInput.addEventListener('input', applyCartesian);
+  ui.radiusInput.addEventListener('input', applyRadial);
+  ui.azimuthInput.addEventListener('input', applyRadial);
+
+  const coordModeListeners = ui.coordModeInputs.map(input => {
+    const listener = (): void => {
+      if (!input.checked) { return; }
+      const radial = input.value === 'radial';
+      ui.cartesianGroup.style.display = radial ? 'none' : '';
+      ui.radialGroup.style.display = radial ? '' : 'none';
+    };
+    input.addEventListener('change', listener);
+    return listener;
+  });
+
   const resetListener = (): void => {
     currentFace = '-x';
     currentPose = {
@@ -155,9 +257,17 @@ export async function initializeSimplePregraspIkVisualization(
     for (const input of ui.faceInputs) {
       input.checked = input.value === currentFace;
     }
+    // Back to Cartesian mode on reset.
+    for (const input of ui.coordModeInputs) {
+      input.checked = input.value === 'cartesian';
+      input.dispatchEvent(new Event('change'));
+    }
+    // Setting X/Y drives the radius/azimuth sliders via applyCartesian.
+    ui.xInput.value = String(Math.round(DEFAULT_IK_CUBE_X * 1000));
+    ui.yInput.value = String(Math.round(DEFAULT_IK_CUBE_Y * 1000));
+    ui.xInput.dispatchEvent(new Event('input'));
+    ui.yInput.dispatchEvent(new Event('input'));
     const defaults = [
-      currentPose.x * 1000,
-      currentPose.y * 1000,
       currentPose.z * 1000,
       currentPose.yaw * 180 / Math.PI,
       currentPose.pitch * 180 / Math.PI,
@@ -196,6 +306,13 @@ export async function initializeSimplePregraspIkVisualization(
       }
       for (const [index, [input]] of poseInputs.entries()) {
         input.removeEventListener('input', poseListeners[index]);
+      }
+      ui.xInput.removeEventListener('input', applyCartesian);
+      ui.yInput.removeEventListener('input', applyCartesian);
+      ui.radiusInput.removeEventListener('input', applyRadial);
+      ui.azimuthInput.removeEventListener('input', applyRadial);
+      for (const [index, input] of ui.coordModeInputs.entries()) {
+        input.removeEventListener('change', coordModeListeners[index]);
       }
       ui.resetButton.removeEventListener('click', resetListener);
       ui.root.remove();
