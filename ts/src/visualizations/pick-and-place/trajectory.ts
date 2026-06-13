@@ -26,6 +26,7 @@ import { createSimplePregraspMatrix } from '../simple-pregrasp-pose/pose';
 // `tipZ - pose.z`.
 const SOURCE_HOVER_TIP_Z = 0.04;
 const PREDROP_HOVER_TIP_Z = 0.02;
+const POSTDROP_HOVER_TIP_Z = 0.04;
 
 // Gripper joint angle at hover pregrasp: 40° open.
 export const GRIPPER_OPEN = 40 * (Math.PI / 180);
@@ -72,6 +73,16 @@ const STAGE3_DURATION = 1.0;
 // Duration of stage 4 – carry the grasped cube to the drop hover above the
 // target (tip 2 cm above the floor).
 const STAGE4_DURATION = 2.0;
+// Stage 5 is one continuous retreat spline through the postdrop hover and back
+// to neutral. The hover is a clearance waypoint, not a stopping point.
+const POSTDROP_HOVER_DURATION = 1.5;
+const RETURN_TO_NEUTRAL_DURATION = 2.0;
+const STAGE5_DURATION = POSTDROP_HOVER_DURATION + RETURN_TO_NEUTRAL_DURATION;
+const RELEASE_OPENING_ANGLE = 5 * (Math.PI / 180);
+const MOVEMENT_OPENING_ANGLE = 10 * (Math.PI / 180);
+// Real gravity covers the 5 mm release gap in about 32 ms. Stretch the
+// ballistic fall enough to remain visible at ordinary playback speed.
+const DROP_DURATION = 0.06;
 
 // Cube-center height of the level cruise. Above the drop hover (2.5 cm) so the
 // cube genuinely rises then descends; clears the cube top with room to spare
@@ -121,6 +132,37 @@ function lerpJoints(a: JointAngles, b: JointAngles, alpha: number): JointAngles 
   const out = {} as JointAngles;
   for (const name of ARM_JOINT_NAMES) {
     out[name] = a[name] + (b[name] - a[name]) * alpha;
+  }
+  return out;
+}
+
+// C2 spline from start through a non-stopping waypoint to end. Both segments
+// share the waypoint velocity and have zero acceleration at the join.
+function splineJointsThroughWaypoint(
+  start: JointAngles,
+  waypoint: JointAngles,
+  end: JointAngles,
+  waypointPhase: number,
+  phase: number
+): JointAngles {
+  const p = Math.min(1, Math.max(0, phase));
+  if (p === 0) { return start; }
+  if (p === 1) { return end; }
+  const out = {} as JointAngles;
+  for (const name of ARM_JOINT_NAMES) {
+    const waypointVelocity =
+      0.5 * (end[name] - waypoint[name]) / (1 - waypointPhase);
+    if (p <= waypointPhase) {
+      out[name] = quinticHermite(
+        start[name], waypoint[name], 0, waypointVelocity,
+        waypointPhase, p / waypointPhase
+      );
+    } else {
+      out[name] = quinticHermite(
+        waypoint[name], end[name], waypointVelocity, 0,
+        1 - waypointPhase, (p - waypointPhase) / (1 - waypointPhase)
+      );
+    }
   }
   return out;
 }
@@ -475,23 +517,27 @@ export function computeTrajectory(
   // arrives at the target in an orientation that is fully determined by which
   // physical face was grasped. The grasp therefore has to be chosen so the
   // *whole* motion works with one face and one elbow: the source hover and
-  // pregrasp, the target hover, AND every point of the carry in between. Faces
-  // are tried in preference order; for each, an elbow that solves the three
-  // keyframes is only accepted if `planCarry` can also follow the carry without
-  // leaving the workspace or exceeding a joint limit anywhere along it.
+  // pregrasp, the target predrop and postdrop hovers, AND every point of the
+  // carry in between. Faces are tried in preference order; for each, an elbow
+  // that solves the four keyframes is only accepted if `planCarry` can also
+  // follow the carry without leaving the workspace or exceeding a joint limit.
   let hoverJoints: JointAngles | null = null;
   let pregraspJoints: JointAngles | null = null;
   let targetHoverJoints: JointAngles | null = null;
+  let predropJoints: JointAngles | null = null;
+  let postdropHoverJoints: JointAngles | null = null;
   let selectedFace: CubeFace | null = null;
   let selectedElbow: 'up' | 'down' | null = null;
   let carryPlan: CarryPlan | null = null;
   const sourceHoverOffset = SOURCE_HOVER_TIP_Z - sourcePose.z;
   const targetHoverOffset = PREDROP_HOVER_TIP_Z - targetPose.z;
+  const postdropHoverOffset = POSTDROP_HOVER_TIP_Z - targetPose.z;
   for (const face of VERTICAL_FACES) {
     const hover = pregraspMatrix(face, sourcePose, sourceHoverOffset);
     const pregrasp = pregraspMatrix(face, sourcePose);
     const targetHover = pregraspMatrix(face, targetPose, targetHoverOffset);
-    if (!hover || !pregrasp || !targetHover) { continue; }
+    const postdropHover = pregraspMatrix(face, targetPose, postdropHoverOffset);
+    if (!hover || !pregrasp || !targetHover || !postdropHover) { continue; }
     const hoverResult = solveSimplePregraspIk(k, hover);
     const pregraspResult = solveSimplePregraspIk(k, pregrasp);
     const targetHoverResult = solveSimplePregraspIk(k, targetHover);
@@ -513,9 +559,22 @@ export function computeTrajectory(
         k, face, elbow, sourcePose, targetPose, targetHoverOffset
       );
       if (!plan) { continue; }
+      const predropMatrix =
+        carryGeometryMatrix(plan, k, 1).multiply(plan.cubeFromGripper);
+      const predropResult = solveSimplePregraspIk(k, predropMatrix);
+      const predropBranch = predropResult.type === 'success'
+        ? predropResult.branches.find(b => b.elbow === elbow)
+        : undefined;
+      const postdropHoverResult = solveSimplePregraspIk(k, postdropHover);
+      const postdropHoverBranch = postdropHoverResult.type === 'success'
+        ? postdropHoverResult.branches.find(b => b.elbow === elbow)
+        : undefined;
+      if (!predropBranch || !postdropHoverBranch) { continue; }
       hoverJoints = hoverBranch.joints;
       pregraspJoints = pregraspBranch.joints;
       targetHoverJoints = targetHoverBranch.joints;
+      predropJoints = predropBranch.joints;
+      postdropHoverJoints = postdropHoverBranch.joints;
       selectedFace = face;
       selectedElbow = elbow;
       carryPlan = plan;
@@ -527,6 +586,8 @@ export function computeTrajectory(
     hoverJoints === null ||
     pregraspJoints === null ||
     targetHoverJoints === null ||
+    predropJoints === null ||
+    postdropHoverJoints === null ||
     selectedFace === null ||
     selectedElbow === null ||
     carryPlan === null
@@ -536,10 +597,23 @@ export function computeTrajectory(
 
   const stage1EndJoints = hoverJoints;
   const stage2EndJoints = pregraspJoints;
-  const stage4EndJoints = targetHoverJoints;
+  const stage4EndJoints = predropJoints;
+  const stage5EndJoints = postdropHoverJoints;
   const stage2End = STAGE1_DURATION + STAGE2_DURATION;
   const stage3End = stage2End + STAGE3_DURATION;
-  const duration = stage3End + STAGE4_DURATION;
+  const stage4End = stage3End + STAGE4_DURATION;
+  const duration = stage4End + STAGE5_DURATION;
+  const releaseOpeningFraction =
+    RELEASE_OPENING_ANGLE / (GRIPPER_OPEN - GRIPPER_CLOSED);
+  const movementOpeningFraction =
+    MOVEMENT_OPENING_ANGLE / (GRIPPER_OPEN - GRIPPER_CLOSED);
+  const releaseTime = releaseOpeningFraction * POSTDROP_HOVER_DURATION;
+  const movementStartTime =
+    movementOpeningFraction * POSTDROP_HOVER_DURATION;
+  const retreatSplineDuration = STAGE5_DURATION - movementStartTime;
+  const hoverSplinePhase =
+    (POSTDROP_HOVER_DURATION - movementStartTime) / retreatSplineDuration;
+  const releasedCubePose = cubePoseFromMatrix(carryCubeMatrix(carryPlan, k, 1));
 
   // Direction pointing from the grasped face into the cube. The cube is pushed
   // the opposite way (toward the fixed jaw) as the gripper closes.
@@ -550,6 +624,46 @@ export function computeTrajectory(
   return {
     duration,
     evaluate(t: number): TrajectoryFrame {
+      if (t >= stage4End) {
+        // Stage 5: wait until the released cube clears the jaws, then follow a
+        // single C2 joint spline through hover and directly back to neutral.
+        const elapsed = Math.min(STAGE5_DURATION, t - stage4End);
+        const openingPhase =
+          Math.min(1, elapsed / POSTDROP_HOVER_DURATION);
+        const movementPhase = Math.min(
+          1, Math.max(0, (elapsed - movementStartTime) / retreatSplineDuration)
+        );
+        const joints = splineJointsThroughWaypoint(
+          stage4EndJoints,
+          stage5EndJoints,
+          NEUTRAL_FRAME.joints,
+          hoverSplinePhase,
+          movementPhase
+        );
+        const gripper = elapsed <= POSTDROP_HOVER_DURATION
+          ? GRIPPER_CLOSED +
+            (GRIPPER_OPEN - GRIPPER_CLOSED) * openingPhase
+          : GRIPPER_OPEN +
+            (NEUTRAL_FRAME.gripper - GRIPPER_OPEN) *
+            smoothstep(
+              (elapsed - POSTDROP_HOVER_DURATION) / RETURN_TO_NEUTRAL_DURATION
+            );
+        return {
+          joints,
+          gripper,
+          sourceCube: openingPhase < releaseOpeningFraction
+            ? releasedCubePose
+            : {
+              ...targetPose,
+              z: Math.max(
+                targetPose.z,
+                releasedCubePose.z -
+                (releasedCubePose.z - targetPose.z) *
+                ((t - stage4End - releaseTime) / DROP_DURATION) ** 2
+              )
+            }
+        };
+      }
       if (t >= stage3End) {
         // Stage 4: carry the grasped cube up and over to the drop hover, along
         // the path mode chosen by `planCarry` (straight when possible, polar

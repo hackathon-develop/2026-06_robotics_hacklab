@@ -60,7 +60,7 @@ describe('pick-and-place trajectory', () => {
     const pregraspTarget = gripperTarget(pregrasp.joints);
 
     expect(start).toEqual({ ...NEUTRAL_FRAME, sourceCube: sourcePose });
-    expect(trajectory.duration).toBe(6);
+    expect(trajectory.duration).toBe(9.5);
     expect(hover.gripper).toBeCloseTo(GRIPPER_OPEN);
     expect(halfwayDown.gripper).toBeCloseTo(GRIPPER_OPEN);
     expect(pregrasp.gripper).toBeCloseTo(GRIPPER_OPEN);
@@ -107,20 +107,100 @@ describe('pick-and-place trajectory', () => {
 
     const grasped = trajectory.evaluate(4);
     const liftingEarly = trajectory.evaluate(4.3);
-    const dropped = trajectory.evaluate(trajectory.duration);
+    const predrop = trajectory.evaluate(6);
 
     // The gripper stays closed for the whole carry.
     expect(grasped.gripper).toBeCloseTo(GRIPPER_CLOSED);
     expect(liftingEarly.gripper).toBeCloseTo(GRIPPER_CLOSED);
-    expect(dropped.gripper).toBeCloseTo(GRIPPER_CLOSED);
+    expect(predrop.gripper).toBeCloseTo(GRIPPER_CLOSED);
 
     // Early in the carry the cube rises before reaching its cruise height.
     expect(liftingEarly.sourceCube.z).toBeGreaterThan(grasped.sourceCube.z + 0.002);
 
     // It ends one hover (0.5 cm) above the target, sitting over the target x/y.
-    expect(dropped.sourceCube.z).toBeCloseTo(CUBE_HALF_SIZE + 0.005, 3);
-    expect(dropped.sourceCube.x).toBeCloseTo(targetPose.x, 3);
-    expect(dropped.sourceCube.y).toBeCloseTo(targetPose.y, 3);
+    expect(predrop.sourceCube.z).toBeCloseTo(CUBE_HALF_SIZE + 0.005, 3);
+    expect(predrop.sourceCube.x).toBeCloseTo(targetPose.x, 3);
+    expect(predrop.sourceCube.y).toBeCloseTo(targetPose.y, 3);
+  });
+
+  it('releases, passes through hover without stopping, and returns neutral', () => {
+    const trajectory = computeTrajectory(kinematics, sourcePose, targetPose);
+    if (!trajectory) { throw new Error('expected source pose to be reachable'); }
+
+    const predrop = trajectory.evaluate(6 - 1e-6);
+    const openingStart = trajectory.evaluate(6);
+    const openingBeforeRelease = trajectory.evaluate(6.2);
+    const falling = trajectory.evaluate(6.275);
+    const droppedWaiting = trajectory.evaluate(6.32);
+    const movingToHover = trajectory.evaluate(6.7);
+    const movementEnding = trajectory.evaluate(7.45);
+    const hover = trajectory.evaluate(7.5);
+    const afterHover = trajectory.evaluate(7.55);
+    const neutral = trajectory.evaluate(trajectory.duration);
+    const predropTarget = gripperTarget(predrop.joints);
+    const openingStartTarget = gripperTarget(openingStart.joints);
+    const beforeReleaseTarget = gripperTarget(openingBeforeRelease.joints);
+    const droppedWaitingTarget = gripperTarget(droppedWaiting.joints);
+    const movingTarget = gripperTarget(movingToHover.joints);
+    const movementEndingTarget = gripperTarget(movementEnding.joints);
+    const hoverTarget = gripperTarget(hover.joints);
+    const afterHoverTarget = gripperTarget(afterHover.joints);
+
+    // Opening is continuous across the whole phase. The arm remains still for
+    // a short beat after release, then moves before the gripper is fully open.
+    expect(openingBeforeRelease.gripper).toBeGreaterThan(GRIPPER_CLOSED);
+    expect(falling.gripper).toBeGreaterThan(openingBeforeRelease.gripper);
+    expect(droppedWaiting.gripper).toBeGreaterThan(openingBeforeRelease.gripper);
+    expect(movingToHover.gripper).toBeGreaterThan(droppedWaiting.gripper);
+    expect(movingToHover.gripper).toBeLessThan(GRIPPER_OPEN);
+    expect(hover.gripper).toBeCloseTo(GRIPPER_OPEN);
+    expect(neutral.gripper).toBeCloseTo(NEUTRAL_FRAME.gripper);
+    expect(movingTarget.z).toBeGreaterThan(predropTarget.z);
+
+    // The released cube visibly accelerates downward, then rests on the target
+    // while the gripper smoothly rises and restores the 1 cm horizontal
+    // safety-margin backoff.
+    expect(openingBeforeRelease.sourceCube.z).toBeCloseTo(CUBE_HALF_SIZE + 0.005, 3);
+    expect(falling.sourceCube.z).toBeLessThan(openingBeforeRelease.sourceCube.z);
+    expect(falling.sourceCube.z).toBeGreaterThan(targetPose.z);
+    expect(droppedWaiting.sourceCube).toEqual(targetPose);
+    expect(movingToHover.sourceCube).toEqual(targetPose);
+    expect(hover.sourceCube).toEqual(targetPose);
+    expect(neutral.sourceCube).toEqual(targetPose);
+    expect(openingStartTarget.x).toBeCloseTo(predropTarget.x, 6);
+    expect(openingStartTarget.y).toBeCloseTo(predropTarget.y, 6);
+    expect(openingStartTarget.z).toBeCloseTo(predropTarget.z, 6);
+    expect(beforeReleaseTarget.x).toBeCloseTo(predropTarget.x, 6);
+    expect(beforeReleaseTarget.y).toBeCloseTo(predropTarget.y, 6);
+    expect(beforeReleaseTarget.z).toBeCloseTo(predropTarget.z, 6);
+    expect(droppedWaitingTarget.x).toBeCloseTo(predropTarget.x, 6);
+    expect(droppedWaitingTarget.y).toBeCloseTo(predropTarget.y, 6);
+    expect(droppedWaitingTarget.z).toBeCloseTo(predropTarget.z, 6);
+    expect(Math.hypot(
+      movingTarget.x - predropTarget.x,
+      movingTarget.y - predropTarget.y
+    )).toBeGreaterThan(0);
+    expect(Math.hypot(
+      hoverTarget.x - predropTarget.x,
+      hoverTarget.y - predropTarget.y
+    )).toBeCloseTo(0.01, 3);
+    expect(hoverTarget.z).toBeCloseTo(0.04, 3);
+
+    // The hover is a waypoint in the return spline: the arm is moving on both
+    // sides of it and finishes at the exact neutral pose.
+    const beforeHoverDistance = Math.hypot(
+      hoverTarget.x - movementEndingTarget.x,
+      hoverTarget.y - movementEndingTarget.y,
+      hoverTarget.z - movementEndingTarget.z
+    );
+    const afterHoverDistance = Math.hypot(
+      afterHoverTarget.x - hoverTarget.x,
+      afterHoverTarget.y - hoverTarget.y,
+      afterHoverTarget.z - hoverTarget.z
+    );
+    expect(beforeHoverDistance).toBeGreaterThan(1e-5);
+    expect(afterHoverDistance).toBeGreaterThan(1e-5);
+    expect(neutral.joints).toEqual(NEUTRAL_FRAME.joints);
   });
 
   it('carries without a discontinuous wrist flip', () => {
