@@ -38,6 +38,8 @@ export interface PickAndPlaceOptions {
   initialJointPositions?: Readonly<Record<string, number>>;
   sourcePosition?: Readonly<{ x: number; y: number; yaw?: number }>;
   targetPosition?: Readonly<{ x: number; y: number; yaw?: number }>;
+  // Build the carry height profile charts and sample the carry profile data.
+  includeCarryProfilePlots?: boolean;
   // Wrap the existing neutral-to-neutral motion with rest-to-neutral and
   // neutral-to-rest phases.
   startFromAndReturnToRestPose?: boolean;
@@ -141,12 +143,17 @@ export async function PickAndPlace(
       thetaLength: workspace.azimuth.max - workspace.azimuth.min
     }
   );
-  const profilePlots = [
-    createCarryProfilePlot('time'),
-    createCarryProfilePlot('distance')
-  ];
-  for (const profilePlot of profilePlots) {
-    ui.viewport.appendChild(profilePlot.element);
+  const includeCarryProfilePlots = options.includeCarryProfilePlots ?? false;
+  const profilePlots = includeCarryProfilePlots
+    ? [
+      createCarryProfilePlot('time'),
+      createCarryProfilePlot('distance')
+    ]
+    : [];
+  if (includeCarryProfilePlots) {
+    for (const profilePlot of profilePlots) {
+      ui.viewport.appendChild(profilePlot.element);
+    }
   }
 
   let sourcePose = { ...initialSource };
@@ -249,8 +256,10 @@ export async function PickAndPlace(
     }
     vizScene.setJoint('gripper', frame.gripper);
     vizScene.updateSourceCube(frame.sourceCube);
-    for (const profilePlot of profilePlots) {
-      profilePlot.setMarker(trajectory.carryFraction(t));
+    if (includeCarryProfilePlots) {
+      for (const profilePlot of profilePlots) {
+        profilePlot.setMarker(trajectory.carryFraction(t));
+      }
     }
   };
   const resetFrame = (): void => {
@@ -308,11 +317,13 @@ export async function PickAndPlace(
       ui.seekInput.max = String(trajectory.duration);
       playbackSeconds = 0;
       applyFrame(playbackSeconds);
-      const profile = trajectory.carryProfile();
-      for (const profilePlot of profilePlots) {
-        profilePlot.setProfile(profile);
-        profilePlot.setMarker(trajectory.carryFraction(0));
-        profilePlot.element.hidden = false;
+      if (includeCarryProfilePlots) {
+        const profile = trajectory.carryProfile();
+        for (const profilePlot of profilePlots) {
+          profilePlot.setProfile(profile);
+          profilePlot.setMarker(trajectory.carryFraction(0));
+          profilePlot.element.hidden = false;
+        }
       }
       setPlaying(true);
     }
