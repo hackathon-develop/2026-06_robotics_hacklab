@@ -19,6 +19,7 @@ import dataclasses
 import math
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 
@@ -68,23 +69,78 @@ NEUTRAL_ARM_JOINTS: dict[str, float] = {
 }
 NEUTRAL_GRIPPER = 0.0
 
-# Phase 1: neutral -> hover pregrasp above the source cube.
-STAGE1_DURATION = 2.0
-# Phase 2: hover pregrasp -> pregrasp at the source cube center (vertical descent).
-STAGE2_DURATION = 1.0
-# Phase 3: close the gripper onto the cube.
-STAGE3_DURATION = 1.0
-# Phase 4: lift and carry the grasped cube over to the hover above the target.
-STAGE4_DURATION = 2.0
-# Phase 5 is one continuous retreat: hold while the cube falls clear, then a
-# single C2 joint spline through the postdrop hover and on to neutral. The hover
-# is a clearance waypoint, not a stopping point.
-STAGE5_HOVER_DURATION = 1.5
-STAGE5_RETURN_DURATION = 2.0
+# --- Phase timing -----------------------------------------------------------
+# Travel phases (approach, carry, retreat) derive their duration from the
+# distance they cover, so the arm holds a roughly constant speed and longer
+# moves simply take longer. Contact phases (descent onto the cube, gripper
+# close, release dwell) keep fixed, gentle durations — there's no meaningful
+# distance to scale and slowing them is what makes the grasp/release reliable.
+
+# Angular speed of the fastest-moving joint through a joint-space move, rad/s.
+# Governs phase 1 (approach) and the phase 5 retreat.
+JOINT_SPEED = 1.0
+# Cartesian speed of the gripper/cube tip along the carry, m/s. Governs phase 4.
+CARTESIAN_SPEED = 0.3
+# Metres of carry arc that one radian of cube yaw is counted as when retiming the
+# carry. Set so a pure in-place rotation is paced at JOINT_SPEED rather than
+# whipping the wrist through the low-translation stretch of the path.
+CARRY_ROTATION_WEIGHT = CARTESIAN_SPEED / JOINT_SPEED
+# Floor on any speed-derived phase so short moves still have room to ease in/out.
+MIN_TRAVEL_DURATION = 0.5
+
+# Phase 2: fixed, gentle vertical descent from the hover onto the cube.
+DESCENT_DURATION = 1.0
+# Phase 3: fixed dwell to close the gripper onto the cube.
+GRASP_DURATION = 1.0
+# Phase 5a: fixed dwell at the drop hover while the gripper opens and the cube
+# falls clear, before the retreat starts. Not a travel phase — the arm holds.
+RELEASE_DURATION = 1.5
 # The arm holds at the drop hover until the gripper has opened this far past the
 # grasp, giving the released cube time to drop clear of the jaws before the arm
 # starts moving (so the retreat doesn't fling it).
 RETREAT_OPENING_ANGLE = math.radians(10.0)
+
+
+# Points sampled along each joint-space move to measure the tip's Cartesian path.
+_TIP_PATH_SAMPLES = 24
+
+
+def _max_joint_travel(*waypoints: dict[str, float]) -> float:
+    """Largest total angular travel of any single joint across ``waypoints``,
+    measured the direct way each joint is lerped between consecutive poses."""
+    return max(
+        sum(abs(waypoints[i + 1][name] - waypoints[i][name]) for i in range(len(waypoints) - 1))
+        for name in ARM_JOINT_NAMES
+    )
+
+
+def _tip_path_length(k: So101Kinematics, *waypoints: dict[str, float]) -> float:
+    """Cartesian length of the gripper-tip path as the arm lerps straight through
+    ``waypoints`` in joint space — the path the approach/retreat actually trace."""
+    length = 0.0
+    previous = k.tip_position(waypoints[0])
+    for a, b in zip(waypoints[:-1], waypoints[1:]):
+        for i in range(1, _TIP_PATH_SAMPLES + 1):
+            point = k.tip_position(_lerp_joints(a, b, i / _TIP_PATH_SAMPLES))
+            length += float(np.linalg.norm(point - previous))
+            previous = point
+    return length
+
+
+def _joint_move_duration(k: So101Kinematics, *waypoints: dict[str, float]) -> float:
+    """Duration of a joint-space move through ``waypoints``: long enough to hold
+    the gripper tip at ``CARTESIAN_SPEED`` *and* keep every joint under
+    ``JOINT_SPEED`` (the cap that bounds tip-static reconfigurations like a wrist
+    roll). Floored at ``MIN_TRAVEL_DURATION``."""
+    tip_time = _tip_path_length(k, *waypoints) / CARTESIAN_SPEED
+    joint_time = _max_joint_travel(*waypoints) / JOINT_SPEED
+    return max(MIN_TRAVEL_DURATION, tip_time, joint_time)
+
+
+def _cartesian_move_duration(distance: float) -> float:
+    """Duration of a Cartesian move of ``distance`` metres at ``CARTESIAN_SPEED``,
+    floored at ``MIN_TRAVEL_DURATION``."""
+    return max(MIN_TRAVEL_DURATION, distance / CARTESIAN_SPEED)
 
 # Cube-center height of the level cruise. Above the predrop hover (2 cm) so the
 # cube genuinely rises then descends; clears the cube top with room to spare
@@ -312,7 +368,9 @@ class CarryPlan:
     drop_radius: float
     grasp_azimuth: float
     drop_azimuth: float
-    # (parameter, arc length) samples for retiming the curve by distance.
+    # (parameter, generalized arc length) samples for retiming the curve. The
+    # length folds in the cube's yaw sweep (see ``_build_arc_table``) so rotation
+    # is paced too, not just translation.
     arc_table: tuple[tuple[float, float], ...] = ()
 
 
@@ -346,9 +404,8 @@ def _carry_path(grasp_z: float, drop_z: float, parameter: float) -> tuple[float,
     return travel, height
 
 
-def _carry_geometry_matrix(plan: CarryPlan, parameter: float) -> Mat4:
-    """World cube pose at a geometry parameter. This defines shape only; playback
-    timing is applied separately by ``_carry_cube_matrix``."""
+def _carry_geometry_pose(plan: CarryPlan, parameter: float) -> tuple[float, float, float, float]:
+    """World (x, y, z, yaw) of the carried cube at a geometry parameter."""
     travel, height = _carry_path(plan.grasp_position[2], plan.drop_position[2], parameter)
     if plan.mode == "straight":
         x = plan.grasp_position[0] + (plan.drop_position[0] - plan.grasp_position[0]) * travel
@@ -359,19 +416,32 @@ def _carry_geometry_matrix(plan: CarryPlan, parameter: float) -> Mat4:
         x = plan.pan_axis[0] + radius * math.cos(azimuth)
         y = plan.pan_axis[1] + radius * math.sin(azimuth)
     yaw = plan.grasp_yaw + _shortest_delta(plan.grasp_yaw, plan.drop_yaw) * travel
+    return x, y, height, yaw
+
+
+def _carry_geometry_matrix(plan: CarryPlan, parameter: float) -> Mat4:
+    """World cube pose at a geometry parameter. This defines shape only; playback
+    timing is applied separately by ``_carry_cube_matrix``."""
+    x, y, height, yaw = _carry_geometry_pose(plan, parameter)
     return tf.translation(x, y, height) @ tf.rot_z(yaw)
 
 
 def _build_arc_table(plan: CarryPlan) -> tuple[tuple[float, float], ...]:
+    """Cumulative (parameter, generalized arc length) along the carry. The length
+    adds the cube's translation to its yaw sweep scaled by ``CARRY_ROTATION_WEIGHT``,
+    so retiming by this length paces rotation and translation together — a cube
+    that mostly spins in place no longer whips the wrist."""
     table: list[tuple[float, float]] = [(0.0, 0.0)]
-    previous = tf.get_position(_carry_geometry_matrix(plan, 0.0))
+    px, py, pz, pyaw = _carry_geometry_pose(plan, 0.0)
     length = 0.0
     for i in range(1, _CARRY_ARC_LENGTH_SAMPLES + 1):
         parameter = i / _CARRY_ARC_LENGTH_SAMPLES
-        position = tf.get_position(_carry_geometry_matrix(plan, parameter))
-        length += float(np.linalg.norm(position - previous))
+        x, y, z, yaw = _carry_geometry_pose(plan, parameter)
+        translation = math.sqrt((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2)
+        rotation = abs(_shortest_delta(pyaw, yaw)) * CARRY_ROTATION_WEIGHT
+        length += translation + rotation
         table.append((parameter, length))
-        previous = position
+        px, py, pz, pyaw = x, y, z, yaw
     return tuple(table)
 
 
@@ -467,12 +537,6 @@ class PickAndCarry:
     carry: CarryPlan
     predrop_joints: dict[str, float]
     postdrop_joints: dict[str, float]
-    stage1_duration: float = STAGE1_DURATION
-    stage2_duration: float = STAGE2_DURATION
-    stage3_duration: float = STAGE3_DURATION
-    stage4_duration: float = STAGE4_DURATION
-    stage5_hover_duration: float = STAGE5_HOVER_DURATION
-    stage5_return_duration: float = STAGE5_RETURN_DURATION
     start_joints: dict[str, float] = dataclasses.field(
         default_factory=lambda: dict(NEUTRAL_ARM_JOINTS)
     )
@@ -482,7 +546,41 @@ class PickAndCarry:
     )
     end_gripper: float = NEUTRAL_GRIPPER
 
-    @property
+    # Durations are derived from the (immutable) geometry and joint poses, so they
+    # are computed once and cached — ``evaluate``/``duration`` are called every sim
+    # step and must not re-run the forward-kinematics sampling each time.
+    @cached_property
+    def stage1_duration(self) -> float:
+        # Approach: joint swing from the start pose to the hover above the cube.
+        return _joint_move_duration(self.k, self.start_joints, self.grasp.hover_joints)
+
+    @cached_property
+    def stage2_duration(self) -> float:
+        return DESCENT_DURATION
+
+    @cached_property
+    def stage3_duration(self) -> float:
+        return GRASP_DURATION
+
+    @cached_property
+    def stage4_duration(self) -> float:
+        # Carry: traverse the generalized arc (translation + weighted yaw) at
+        # CARTESIAN_SPEED, so both the cube travel and the wrist rotation stay
+        # within their speed limits and a longer carry takes proportionally longer.
+        return _cartesian_move_duration(self.carry.arc_table[-1][1])
+
+    @cached_property
+    def stage5_hover_duration(self) -> float:
+        return RELEASE_DURATION
+
+    @cached_property
+    def stage5_return_duration(self) -> float:
+        # Retreat: joint spline up through the postdrop hover and on to the end
+        # pose. (The arm actually starts moving in the tail of the hover phase, so
+        # its real speed is a touch under the target — safely on the slow side.)
+        return _joint_move_duration(self.k, self.predrop_joints, self.postdrop_joints, self.end_joints)
+
+    @cached_property
     def duration(self) -> float:
         return (
             self.stage1_duration
@@ -500,8 +598,12 @@ class PickAndCarry:
         stage4_end = stage3_end + self.stage4_duration
 
         if t < stage1_end:
-            # Phase 1: swing from start to the hover, opening the gripper.
-            alpha = _smoothstep(t / self.stage1_duration) if self.stage1_duration > 0 else 1.0
+            # Phase 1: swing from start to the hover, opening the gripper. Uses the
+            # same trapezoidal profile as the carry (smooth ramp up, constant cruise,
+            # smooth ramp down) so a longer approach holds top speed rather than being
+            # one continuous ease, while still leaving/arriving with zero velocity and
+            # acceleration.
+            alpha = _timed_arc_fraction(t / self.stage1_duration) if self.stage1_duration > 0 else 1.0
             joints = _lerp_joints(self.start_joints, self.grasp.hover_joints, alpha)
             gripper = self.start_gripper + (GRIPPER_OPEN - self.start_gripper) * alpha
             return Frame(joints=joints, gripper=gripper)
