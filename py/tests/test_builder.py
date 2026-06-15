@@ -7,10 +7,10 @@ import numpy as np
 from pick_and_place import add_camera_module, build_robot
 from pick_and_place.camera_module import BOARD_HALF_SIZE, LENS_HALF_LENGTH, LENS_POS, LENS_RADIUS
 from pick_and_place.collision_boxes import COLLISION_BOXES
+from pick_and_place.wrist_camera import _MOUNT_VISUAL_POS
 from pick_and_place.wrist_camera_mount_collision_boxes import (
     WRIST_CAMERA_MOUNT_COLLISION_BOXES,
 )
-from pick_and_place.wrist_camera import _MOUNT_VISUAL_POS
 
 
 def box_names():

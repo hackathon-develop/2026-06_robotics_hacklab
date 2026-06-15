@@ -5,7 +5,7 @@ import mujoco
 import numpy as np
 
 from pick_and_place import build_scene, export_scene
-from pick_and_place.workspace_overlays import WORKSPACE_OVERLAYS, WORKSPACE_OVERLAY_GROUP
+from pick_and_place.workspace_overlays import WORKSPACE_OVERLAY_GROUP, WORKSPACE_OVERLAYS
 
 
 def test_scene_contains_robot_floor_light_and_cube():

@@ -14,9 +14,10 @@ phase 2 (hover -> pregrasp at the source cube center).
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 
-from pick_and_place.geometry import CubeFace, CubePose, VERTICAL_FACES, pregrasp_matrix
+from pick_and_place.geometry import VERTICAL_FACES, CubeFace, CubePose, pregrasp_matrix
 from pick_and_place.ik import solve_simple_pregrasp_ik
 from pick_and_place.kinematics import ARM_JOINT_NAMES, So101Kinematics
 
@@ -97,15 +98,13 @@ def _face_naturalness(k: So101Kinematics, face: CubeFace, source: CubePose) -> f
     return (nx * dx + ny * dy) / dist
 
 
-def select_grasp(k: So101Kinematics, source: CubePose) -> GraspChoice:
-    """Pick the grasp face and elbow for the source cube.
+def grasp_candidates(k: So101Kinematics, source: CubePose) -> Iterator[GraspChoice]:
+    """Yield every IK-feasible grasp in preference order (naturalness, then elbow-up).
 
     Faces are tried in order of naturalness (outward normal most aligned with
-    cube→robot direction first), so that a roll-blocked near-side face does not
-    cause the arm to fall through to the far side. For each candidate the entire
-    hover→pregrasp descent is verified at ``_N_DESCENT_CHECKS`` intermediate
-    heights, not just the endpoints, ensuring the IK never needs to fall back to
-    the joint lerp mid-descent. Prefers elbow-up.
+    cube→robot direction first). For each candidate the entire hover→pregrasp
+    descent is verified at ``_N_DESCENT_CHECKS`` intermediate heights so the IK
+    never needs to fall back to the joint lerp mid-descent.
     """
     hover_offset = SOURCE_HOVER_TIP_Z - source.z
     sorted_faces = sorted(VERTICAL_FACES, key=lambda f: _face_naturalness(k, f, source), reverse=True)
@@ -121,7 +120,6 @@ def select_grasp(k: So101Kinematics, source: CubePose) -> GraspChoice:
             pregrasp_branch = next((b for b in pregrasp_branches if b.elbow == elbow), None)
             if hover_branch is None or pregrasp_branch is None:
                 continue
-            # Verify IK is feasible at every intermediate descent height.
             descent_ok = True
             for i in range(1, _N_DESCENT_CHECKS):
                 frac = i / _N_DESCENT_CHECKS
@@ -134,13 +132,20 @@ def select_grasp(k: So101Kinematics, source: CubePose) -> GraspChoice:
                     break
             if not descent_ok:
                 continue
-            return GraspChoice(
+            yield GraspChoice(
                 face=face,
                 elbow=elbow,
                 hover_joints=hover_branch.joints,
                 pregrasp_joints=pregrasp_branch.joints,
             )
-    raise ValueError("No reachable grasp for the source cube")
+
+
+def select_grasp(k: So101Kinematics, source: CubePose) -> GraspChoice:
+    """Return the first IK-feasible grasp from ``grasp_candidates``."""
+    candidate = next(grasp_candidates(k, source), None)
+    if candidate is None:
+        raise ValueError("No reachable grasp for the source cube")
+    return candidate
 
 
 @dataclass(frozen=True)
