@@ -78,4 +78,8 @@ def _add_pick_cube(spec: mujoco.MjSpec) -> None:
         type=mujoco.mjtGeom.mjGEOM_BOX,
         size=(0.015, 0.015, 0.015),
         rgba=(0.82, 0.12, 0.08, 1.0),
+        mass=0.0137,
+        priority=1,
+        solref=(0.002, 1.0),
+        solimp=(0.95, 0.99, 0.001, 0.5, 2.0),
     )
