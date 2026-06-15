@@ -10,7 +10,8 @@ is stepped, so gravity and contact are live. The cube gets a free joint and rest
 on the floor as a genuine rigid body.
 
 Phases: (1) neutral -> hover, (2) hover -> pregrasp at cube center, (3) grasp,
-(4) lift and carry the grasped cube over to the hover above the target.
+(4) lift and carry the grasped cube over to the hover above the target,
+(5) release, lift clear, and flow back to neutral.
 """
 
 from __future__ import annotations

@@ -9,7 +9,8 @@ straight to ``qpos``.
 
 Phases: (1) neutral -> hover, (2) hover -> pregrasp at cube center, (3) close
 gripper to grasp, (4) lift and carry the grasped cube up and over to the hover
-above the target.
+above the target, (5) release, lift clear, and flow back to neutral. The release
+is left to gravity: the gripper set point opens and the cube falls on its own.
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ SOURCE_HOVER_TIP_Z = 0.04
 # Tip-contact height of the hover the carry ends at, above the target (lower
 # than the source hover, ready for a gentle release).
 PREDROP_HOVER_TIP_Z = 0.02
+# Tip-contact height of the hover the retreat lifts to after releasing, clearing
+# the dropped cube before flowing back to neutral.
+POSTDROP_HOVER_TIP_Z = 0.04
 
 # Gripper joint angle at the hover pregrasp: 40 deg open.
 GRIPPER_OPEN = math.radians(40.0)
@@ -72,6 +76,15 @@ STAGE2_DURATION = 1.0
 STAGE3_DURATION = 1.0
 # Phase 4: lift and carry the grasped cube over to the hover above the target.
 STAGE4_DURATION = 2.0
+# Phase 5 is one continuous retreat: hold while the cube falls clear, then a
+# single C2 joint spline through the postdrop hover and on to neutral. The hover
+# is a clearance waypoint, not a stopping point.
+STAGE5_HOVER_DURATION = 1.5
+STAGE5_RETURN_DURATION = 2.0
+# The arm holds at the drop hover until the gripper has opened this far past the
+# grasp, giving the released cube time to drop clear of the jaws before the arm
+# starts moving (so the retreat doesn't fling it).
+RETREAT_OPENING_ANGLE = math.radians(10.0)
 
 # Cube-center height of the level cruise. Above the predrop hover (2 cm) so the
 # cube genuinely rises then descends; clears the cube top with room to spare
@@ -106,6 +119,38 @@ def _smoothstep(t: float) -> float:
 
 def _lerp_joints(a: dict[str, float], b: dict[str, float], alpha: float) -> dict[str, float]:
     return {name: a[name] + (b[name] - a[name]) * alpha for name in ARM_JOINT_NAMES}
+
+
+def _spline_joints_through_waypoint(
+    start: dict[str, float],
+    waypoint: dict[str, float],
+    end: dict[str, float],
+    waypoint_phase: float,
+    phase: float,
+) -> dict[str, float]:
+    """C2 joint spline from ``start`` through a non-stopping ``waypoint`` to ``end``.
+
+    Both segments share the waypoint velocity and have zero acceleration at the
+    join, so the arm flows through the clearance hover without pausing.
+    """
+    p = min(1.0, max(0.0, phase))
+    if p <= 0.0:
+        return dict(start)
+    if p >= 1.0:
+        return dict(end)
+    out: dict[str, float] = {}
+    for name in ARM_JOINT_NAMES:
+        waypoint_velocity = 0.5 * (end[name] - waypoint[name]) / (1.0 - waypoint_phase)
+        if p <= waypoint_phase:
+            out[name] = _quintic_hermite(
+                start[name], waypoint[name], 0.0, waypoint_velocity, waypoint_phase, p / waypoint_phase
+            )
+        else:
+            out[name] = _quintic_hermite(
+                waypoint[name], end[name], waypoint_velocity, 0.0,
+                1.0 - waypoint_phase, (p - waypoint_phase) / (1.0 - waypoint_phase),
+            )
+    return out
 
 
 def _shortest_delta(a: float, b: float) -> float:
@@ -413,7 +458,7 @@ def plan_carry(
 
 @dataclass(frozen=True)
 class PickAndCarry:
-    """Phases 1-4: neutral -> hover -> pregrasp -> grasp -> carry to target hover."""
+    """Phases 1-5: neutral -> hover -> pregrasp -> grasp -> carry -> retreat to neutral."""
 
     k: So101Kinematics
     source: CubePose
@@ -421,10 +466,13 @@ class PickAndCarry:
     grasp: GraspChoice
     carry: CarryPlan
     predrop_joints: dict[str, float]
+    postdrop_joints: dict[str, float]
     stage1_duration: float = STAGE1_DURATION
     stage2_duration: float = STAGE2_DURATION
     stage3_duration: float = STAGE3_DURATION
     stage4_duration: float = STAGE4_DURATION
+    stage5_hover_duration: float = STAGE5_HOVER_DURATION
+    stage5_return_duration: float = STAGE5_RETURN_DURATION
 
     @property
     def duration(self) -> float:
@@ -433,12 +481,15 @@ class PickAndCarry:
             + self.stage2_duration
             + self.stage3_duration
             + self.stage4_duration
+            + self.stage5_hover_duration
+            + self.stage5_return_duration
         )
 
     def evaluate(self, t: float) -> Frame:
         stage1_end = self.stage1_duration
         stage2_end = stage1_end + self.stage2_duration
         stage3_end = stage2_end + self.stage3_duration
+        stage4_end = stage3_end + self.stage4_duration
 
         if t < stage1_end:
             # Phase 1: swing from neutral to the hover, opening the gripper.
@@ -476,24 +527,52 @@ class PickAndCarry:
             gripper = GRIPPER_OPEN + (GRIPPER_GRASP - GRIPPER_OPEN) * alpha
             return Frame(joints=self.grasp.pregrasp_joints, gripper=gripper)
 
-        # Phase 4: lift and carry the grasped cube up and over to the hover above
-        # the target, the gripper following the cube along the planned curve. The
-        # plan was validated across the whole sweep, so the per-frame IK resolves
-        # cleanly; the joint lerp is only a defensive fallback for edge cases.
-        phase = (
-            min(1.0, (t - stage3_end) / self.stage4_duration) if self.stage4_duration > 0 else 1.0
+        if t < stage4_end:
+            # Phase 4: lift and carry the grasped cube up and over to the hover above
+            # the target, the gripper following the cube along the planned curve. The
+            # plan was validated across the whole sweep, so the per-frame IK resolves
+            # cleanly; the joint lerp is only a defensive fallback for edge cases.
+            phase = (
+                min(1.0, (t - stage3_end) / self.stage4_duration) if self.stage4_duration > 0 else 1.0
+            )
+            gripper_matrix = _carry_cube_matrix(self.carry, phase) @ self.carry.cube_from_gripper
+            branch = next(
+                (b for b in solve_simple_pregrasp_ik(self.k, gripper_matrix) if b.elbow == self.grasp.elbow),
+                None,
+            )
+            joints = (
+                branch.joints
+                if branch is not None
+                else _lerp_joints(self.grasp.pregrasp_joints, self.predrop_joints, _smoothstep(phase))
+            )
+            return Frame(joints=joints, gripper=GRIPPER_GRASP)
+
+        # Phase 5: release the cube and retreat. The gripper opens (gravity drops
+        # the cube), then the arm flows up through the postdrop hover and on to
+        # neutral along one C2 joint spline — the hover is a non-stopping clearance
+        # waypoint. The arm holds still until the gripper has opened far enough for
+        # the cube to fall clear, so the retreat doesn't fling it.
+        stage5_duration = self.stage5_hover_duration + self.stage5_return_duration
+        elapsed = min(stage5_duration, t - stage4_end)
+        opening_fraction = RETREAT_OPENING_ANGLE / (GRIPPER_OPEN - GRIPPER_GRASP)
+        movement_start = opening_fraction * self.stage5_hover_duration
+        retreat_duration = stage5_duration - movement_start
+        hover_phase = (self.stage5_hover_duration - movement_start) / retreat_duration
+        movement_phase = min(1.0, max(0.0, (elapsed - movement_start) / retreat_duration))
+        joints = _spline_joints_through_waypoint(
+            self.predrop_joints,
+            self.postdrop_joints,
+            NEUTRAL_ARM_JOINTS,
+            hover_phase,
+            movement_phase,
         )
-        gripper_matrix = _carry_cube_matrix(self.carry, phase) @ self.carry.cube_from_gripper
-        branch = next(
-            (b for b in solve_simple_pregrasp_ik(self.k, gripper_matrix) if b.elbow == self.grasp.elbow),
-            None,
-        )
-        joints = (
-            branch.joints
-            if branch is not None
-            else _lerp_joints(self.grasp.pregrasp_joints, self.predrop_joints, _smoothstep(phase))
-        )
-        return Frame(joints=joints, gripper=GRIPPER_GRASP)
+        if elapsed <= self.stage5_hover_duration:
+            open_alpha = elapsed / self.stage5_hover_duration if self.stage5_hover_duration > 0 else 1.0
+            gripper = GRIPPER_GRASP + (GRIPPER_OPEN - GRIPPER_GRASP) * open_alpha
+        else:
+            close_alpha = _smoothstep((elapsed - self.stage5_hover_duration) / self.stage5_return_duration)
+            gripper = GRIPPER_OPEN + (NEUTRAL_GRIPPER - GRIPPER_OPEN) * close_alpha
+        return Frame(joints=joints, gripper=gripper)
 
 
 def pick_and_carry_candidates(
@@ -502,18 +581,26 @@ def pick_and_carry_candidates(
     """Yield full pick-and-carry trajectories in grasp preference order.
 
     A grasp is usable only if the same face and elbow that grasp the source can
-    also follow the carry to the target hover; candidates whose carry cannot be
-    planned on that branch are skipped.
+    also follow the carry to the target hover and reach the postdrop hover it
+    retreats through; candidates that fail either check on that branch are skipped.
     """
     for grasp in grasp_candidates(k, source):
         carry = plan_carry(k, grasp, source, target)
         if carry is None:
             continue
         endpoint = _carry_geometry_matrix(carry, 1.0) @ carry.cube_from_gripper
-        branch = next(
+        predrop_branch = next(
             (b for b in solve_simple_pregrasp_ik(k, endpoint) if b.elbow == grasp.elbow), None
         )
-        if branch is None:
+        if predrop_branch is None:
+            continue
+        postdrop_hover = pregrasp_matrix(grasp.face, target, POSTDROP_HOVER_TIP_Z - target.z)
+        if postdrop_hover is None:
+            continue
+        postdrop_branch = next(
+            (b for b in solve_simple_pregrasp_ik(k, postdrop_hover) if b.elbow == grasp.elbow), None
+        )
+        if postdrop_branch is None:
             continue
         yield PickAndCarry(
             k=k,
@@ -521,5 +608,6 @@ def pick_and_carry_candidates(
             target=target,
             grasp=grasp,
             carry=carry,
-            predrop_joints=branch.joints,
+            predrop_joints=predrop_branch.joints,
+            postdrop_joints=postdrop_branch.joints,
         )
