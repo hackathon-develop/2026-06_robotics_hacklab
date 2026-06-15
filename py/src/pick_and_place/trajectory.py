@@ -20,6 +20,11 @@ from pick_and_place.geometry import CubeFace, CubePose, VERTICAL_FACES, pregrasp
 from pick_and_place.ik import solve_simple_pregrasp_ik
 from pick_and_place.kinematics import ARM_JOINT_NAMES, So101Kinematics
 
+# Number of intermediate heights checked along the hover→pregrasp descent when
+# selecting a grasp. Catching joint-limit violations between endpoints prevents
+# the arm from falling back to the joint lerp mid-descent.
+_N_DESCENT_CHECKS = 8
+
 # Tip-contact height of the source hover above the floor (clears the 3 cm cube
 # top by 1 cm). At the grasp the tip sits at the cube-center height, so the
 # world-z offset applied to the pregrasp is ``tip_z - pose.z``.
@@ -71,16 +76,40 @@ class GraspChoice:
     pregrasp_joints: dict[str, float]
 
 
+def _face_naturalness(k: So101Kinematics, face: CubeFace, source: CubePose) -> float:
+    """Dot product of the face outward-normal with the cube→robot direction.
+
+    Higher means the face is pointing more toward the robot, i.e. is the most
+    natural side to approach from. Used to sort candidates before trying IK, so
+    the arm never falls through to a far-side face when a near-side one is only
+    slightly roll-blocked.
+    """
+    dx = k.pan_axis[0] - source.x
+    dy = k.pan_axis[1] - source.y
+    dist = math.hypot(dx, dy)
+    if dist < 1e-6:
+        return 0.0
+    c, s = math.cos(source.yaw), math.sin(source.yaw)
+    normals: dict[CubeFace, tuple[float, float]] = {
+        "+x": (c, s), "-x": (-c, -s), "+y": (-s, c), "-y": (s, -c)
+    }
+    nx, ny = normals[face]
+    return (nx * dx + ny * dy) / dist
+
+
 def select_grasp(k: So101Kinematics, source: CubePose) -> GraspChoice:
     """Pick the grasp face and elbow for the source cube.
 
-    Simplified placeholder: tries the vertical faces in preference order and
-    takes the first one whose hover and at-cube pregrasp are both reachable on a
-    single elbow branch, preferring elbow-up. The full selection (which must also
-    satisfy the carry and drop) arrives with the later phases.
+    Faces are tried in order of naturalness (outward normal most aligned with
+    cube→robot direction first), so that a roll-blocked near-side face does not
+    cause the arm to fall through to the far side. For each candidate the entire
+    hover→pregrasp descent is verified at ``_N_DESCENT_CHECKS`` intermediate
+    heights, not just the endpoints, ensuring the IK never needs to fall back to
+    the joint lerp mid-descent. Prefers elbow-up.
     """
     hover_offset = SOURCE_HOVER_TIP_Z - source.z
-    for face in VERTICAL_FACES:
+    sorted_faces = sorted(VERTICAL_FACES, key=lambda f: _face_naturalness(k, f, source), reverse=True)
+    for face in sorted_faces:
         hover = pregrasp_matrix(face, source, hover_offset)
         pregrasp = pregrasp_matrix(face, source)
         if hover is None or pregrasp is None:
@@ -91,6 +120,19 @@ def select_grasp(k: So101Kinematics, source: CubePose) -> GraspChoice:
             hover_branch = next((b for b in hover_branches if b.elbow == elbow), None)
             pregrasp_branch = next((b for b in pregrasp_branches if b.elbow == elbow), None)
             if hover_branch is None or pregrasp_branch is None:
+                continue
+            # Verify IK is feasible at every intermediate descent height.
+            descent_ok = True
+            for i in range(1, _N_DESCENT_CHECKS):
+                frac = i / _N_DESCENT_CHECKS
+                inter = pregrasp_matrix(face, source, hover_offset * (1.0 - frac))
+                if inter is None:
+                    descent_ok = False
+                    break
+                if not any(b.elbow == elbow for b in solve_simple_pregrasp_ik(k, inter)):
+                    descent_ok = False
+                    break
+            if not descent_ok:
                 continue
             return GraspChoice(
                 face=face,

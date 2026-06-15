@@ -14,9 +14,12 @@ import numpy as np
 # These values are pinned from ts/src/visualizations/workspace-overlay.ts and
 # ts/src/ik/workspace.ts for the stock SO-101 model. Recompute them when the
 # robot kinematics or the TypeScript workspace definitions change.
-_PAN_AXIS = (0.0388353, -8.97657e-09)
-_AZIMUTH_MIN = -1.9198621771937634
-_AZIMUTH_LENGTH = 3.839724354387525
+PAN_AXIS = (0.0388353, -8.97657e-09)
+AZIMUTH_MIN = -1.9198621771937634
+AZIMUTH_MAX = AZIMUTH_MIN + 3.839724354387525
+_PAN_AXIS = PAN_AXIS
+_AZIMUTH_MIN = AZIMUTH_MIN
+_AZIMUTH_LENGTH = AZIMUTH_MAX - AZIMUTH_MIN
 
 WORKSPACE_OVERLAY_GROUP = 4
 _SEGMENTS = 96
