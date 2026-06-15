@@ -458,7 +458,7 @@ def plan_carry(
 
 @dataclass(frozen=True)
 class PickAndCarry:
-    """Phases 1-5: neutral -> hover -> pregrasp -> grasp -> carry -> retreat to neutral."""
+    """Phases 1-5: start -> hover -> pregrasp -> grasp -> carry -> retreat to end."""
 
     k: So101Kinematics
     source: CubePose
@@ -473,6 +473,14 @@ class PickAndCarry:
     stage4_duration: float = STAGE4_DURATION
     stage5_hover_duration: float = STAGE5_HOVER_DURATION
     stage5_return_duration: float = STAGE5_RETURN_DURATION
+    start_joints: dict[str, float] = dataclasses.field(
+        default_factory=lambda: dict(NEUTRAL_ARM_JOINTS)
+    )
+    start_gripper: float = NEUTRAL_GRIPPER
+    end_joints: dict[str, float] = dataclasses.field(
+        default_factory=lambda: dict(NEUTRAL_ARM_JOINTS)
+    )
+    end_gripper: float = NEUTRAL_GRIPPER
 
     @property
     def duration(self) -> float:
@@ -492,10 +500,10 @@ class PickAndCarry:
         stage4_end = stage3_end + self.stage4_duration
 
         if t < stage1_end:
-            # Phase 1: swing from neutral to the hover, opening the gripper.
+            # Phase 1: swing from start to the hover, opening the gripper.
             alpha = _smoothstep(t / self.stage1_duration) if self.stage1_duration > 0 else 1.0
-            joints = _lerp_joints(NEUTRAL_ARM_JOINTS, self.grasp.hover_joints, alpha)
-            gripper = NEUTRAL_GRIPPER + (GRIPPER_OPEN - NEUTRAL_GRIPPER) * alpha
+            joints = _lerp_joints(self.start_joints, self.grasp.hover_joints, alpha)
+            gripper = self.start_gripper + (GRIPPER_OPEN - self.start_gripper) * alpha
             return Frame(joints=joints, gripper=gripper)
 
         if t < stage2_end:
@@ -562,7 +570,7 @@ class PickAndCarry:
         joints = _spline_joints_through_waypoint(
             self.predrop_joints,
             self.postdrop_joints,
-            NEUTRAL_ARM_JOINTS,
+            self.end_joints,
             hover_phase,
             movement_phase,
         )
@@ -571,7 +579,7 @@ class PickAndCarry:
             gripper = GRIPPER_GRASP + (GRIPPER_OPEN - GRIPPER_GRASP) * open_alpha
         else:
             close_alpha = _smoothstep((elapsed - self.stage5_hover_duration) / self.stage5_return_duration)
-            gripper = GRIPPER_OPEN + (NEUTRAL_GRIPPER - GRIPPER_OPEN) * close_alpha
+            gripper = GRIPPER_OPEN + (self.end_gripper - GRIPPER_OPEN) * close_alpha
         return Frame(joints=joints, gripper=gripper)
 
 

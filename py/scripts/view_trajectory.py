@@ -17,6 +17,7 @@ Phases: (1) neutral -> hover, (2) hover -> pregrasp at cube center, (3) grasp,
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import math
 import time
 
@@ -28,6 +29,7 @@ from pick_and_place import build_scene
 from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
 from pick_and_place.kinematics import derive_kinematics
 from pick_and_place.trajectory import (
+    GRIPPER_OPEN,
     NEUTRAL_ARM_JOINTS,
     NEUTRAL_GRIPPER,
     PickAndCarry,
@@ -141,6 +143,19 @@ def _random_cube() -> CubePose:
     )
 
 
+_NEAR_NEUTRAL_JOINT_SCALE = 0.4  # ±radians of random joint perturbation from neutral
+
+
+def _random_near_neutral() -> tuple[dict[str, float], float]:
+    """Return arm joints and gripper perturbed slightly from the neutral pose."""
+    joints = {
+        name: value + np.random.uniform(-_NEAR_NEUTRAL_JOINT_SCALE, _NEAR_NEUTRAL_JOINT_SCALE)
+        for name, value in NEUTRAL_ARM_JOINTS.items()
+    }
+    gripper = float(np.random.uniform(0.0, GRIPPER_OPEN))
+    return joints, gripper
+
+
 def _set_joint(model: mujoco.MjModel, data: mujoco.MjData, name: str, value: float) -> None:
     jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
     data.qpos[model.jnt_qposadr[jid]] = value
@@ -166,65 +181,83 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.source is not None:
-        source = CubePose(x=args.source[0], y=args.source[1], z=CUBE_HALF_SIZE)
-    else:
-        source = _random_cube()
-        print(f"source: x={source.x:.4f}  y={source.y:.4f}  yaw={math.degrees(source.yaw):.1f}°")
+    fixed_source = args.source is not None
+    fixed_target = args.target is not None
 
-    if args.target is not None:
-        target = CubePose(x=args.target[0], y=args.target[1], z=CUBE_HALF_SIZE)
-    else:
-        target = _random_cube()
-        print(f"target: x={target.x:.4f}  y={target.y:.4f}  yaw={math.degrees(target.yaw):.1f}°")
+    attempt = 0
+    while True:
+        attempt += 1
 
-    spec = build_scene()
-    cube = spec.body("pick_cube")
-    cube.pos = (source.x, source.y, source.z)
-    half_yaw = source.yaw / 2.0
-    cube.quat = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
-    cube.add_freejoint()  # make the cube a real dynamic body
-    model = spec.compile()
-    data = mujoco.MjData(model)
+        source = (
+            CubePose(x=args.source[0], y=args.source[1], z=CUBE_HALF_SIZE)
+            if fixed_source
+            else _random_cube()
+        )
+        target = (
+            CubePose(x=args.target[0], y=args.target[1], z=CUBE_HALF_SIZE)
+            if fixed_target
+            else _random_cube()
+        )
+        start_joints, start_gripper = _random_near_neutral()
+        end_joints, end_gripper = _random_near_neutral()
 
-    kinematics = derive_kinematics(model)
+        spec = build_scene()
+        cube = spec.body("pick_cube")
+        cube.pos = (source.x, source.y, source.z)
+        half_yaw = source.yaw / 2.0
+        cube.quat = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+        cube.add_freejoint()  # make the cube a real dynamic body
+        model = spec.compile()
+        data = mujoco.MjData(model)
 
-    # Start at the neutral pose, gripper closed, holding via the servos.
-    actuator_id = {
-        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i): i
-        for i in range(model.nu)
-    }
-    for name, value in NEUTRAL_ARM_JOINTS.items():
-        _set_joint(model, data, name, value)
-        data.ctrl[actuator_id[name]] = value
-    data.ctrl[actuator_id["gripper"]] = NEUTRAL_GRIPPER
+        kinematics = derive_kinematics(model)
 
-    # Compensate for the physical 2.8° (0.0486795 rad) arm twist.
-    wrist_roll = math.radians(2.8 - 90)
-    _set_joint(model, data, "wrist_roll", wrist_roll)
-    data.ctrl[actuator_id["wrist_roll"]] = wrist_roll
+        actuator_id = {
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i): i
+            for i in range(model.nu)
+        }
+        for name, value in start_joints.items():
+            _set_joint(model, data, name, value)
+            data.ctrl[actuator_id[name]] = value
+        data.ctrl[actuator_id["gripper"]] = start_gripper
 
-    mujoco.mj_forward(model, data)
+        mujoco.mj_forward(model, data)
 
-    robot_geom_ids, env_geom_ids = _build_geom_sets(model)
+        robot_geom_ids, env_geom_ids = _build_geom_sets(model)
 
-    trajectory = None
-    for traj in pick_and_carry_candidates(kinematics, source, target):
-        grasp = traj.grasp
-        events = _preflight(model, traj, actuator_id, robot_geom_ids, env_geom_ids)
-        unexpected = [(t, n1, n2) for t, n1, n2 in events if _is_unexpected(n1, n2)]
-        if not unexpected:
-            trajectory = traj
-            print(f"grasp: face={grasp.face}  elbow={grasp.elbow}  carry={traj.carry.mode}  (pre-flight clean)")
+        trajectory = None
+        for traj in pick_and_carry_candidates(kinematics, source, target):
+            grasp = traj.grasp
+            events = _preflight(model, traj, actuator_id, robot_geom_ids, env_geom_ids)
+            unexpected = [(t, n1, n2) for t, n1, n2 in events if _is_unexpected(n1, n2)]
+            if not unexpected:
+                trajectory = traj
+                print(
+                    f"source: x={source.x:.4f}  y={source.y:.4f}  yaw={math.degrees(source.yaw):.1f}°"
+                    f"  target: x={target.x:.4f}  y={target.y:.4f}  yaw={math.degrees(target.yaw):.1f}°"
+                )
+                print(f"grasp: face={grasp.face}  elbow={grasp.elbow}  carry={traj.carry.mode}  (attempt {attempt})")
+                break
+            seen_pairs: set[tuple[str, str]] = set()
+            for t, n1, n2 in unexpected:
+                key = (min(n1, n2), max(n1, n2))
+                if key not in seen_pairs:
+                    seen_pairs.add(key)
+                    print(f"skip {grasp.face}/{grasp.elbow}: collision t={t:.3f}s  {n1} ↔ {n2}")
+
+        if trajectory is not None:
             break
-        seen_pairs: set[tuple[str, str]] = set()
-        for t, n1, n2 in unexpected:
-            key = (min(n1, n2), max(n1, n2))
-            if key not in seen_pairs:
-                seen_pairs.add(key)
-                print(f"skip {grasp.face}/{grasp.elbow}: collision t={t:.3f}s  {n1} ↔ {n2}")
-    if trajectory is None:
-        raise ValueError("no collision-free pick-and-carry found for this source/target")
+        if fixed_source and fixed_target:
+            raise ValueError("no collision-free pick-and-carry found for this source/target")
+        print(f"attempt {attempt}: no trajectory found, resampling...")
+
+    trajectory = dataclasses.replace(
+        trajectory,
+        start_joints=start_joints,
+        start_gripper=start_gripper,
+        end_joints=end_joints,
+        end_gripper=end_gripper,
+    )
 
     prev_contacts: set[tuple[str, str]] = set()
     with mujoco.viewer.launch_passive(model, data) as viewer:
