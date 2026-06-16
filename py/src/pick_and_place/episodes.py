@@ -3,8 +3,9 @@
 
 """Sample and prepare random pick-and-carry episodes under live physics.
 
-Shared by ``view_trajectory`` (one interactive run) and ``record_episodes``
-(batch dataset generation). Both need to draw random source/target cube poses
+Shared by ``view_trajectory`` (sim-only viewer), ``real_analytic_pick_and_place``
+(the hardware path) and ``record_episodes`` (batch dataset generation). All need
+to draw random source/target cube poses
 and near-neutral start/end arm poses, build the scene with a dynamic cube, and
 search ``pick_and_carry_candidates`` (vetting each with a collision preflight)
 for a trajectory that runs clean — resampling the poses until one is found.
