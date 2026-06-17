@@ -58,8 +58,8 @@ POSTDROP_HOVER_TIP_Z = 0.04
 
 # Gripper joint angle at the hover pregrasp: 40 deg open.
 GRIPPER_OPEN = math.radians(40.0)
-# Gripper joint angle commanded during the grasp: geometry-derived contact position.
-GRIPPER_GRASP = 0.190589954318
+# Gripper joint angle commanded during the grasp.
+GRIPPER_GRASP = 0.10
 
 NEUTRAL_ARM_JOINTS: dict[str, float] = {
     "shoulder_pan": 0.0,
