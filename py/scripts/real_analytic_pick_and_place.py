@@ -201,43 +201,52 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.source is not None:
-        source = CubePose(x=args.source[0], y=args.source[1], z=CUBE_HALF_SIZE)
+    max_tries = 3
+    for attempt in range(max_tries):
+        if attempt > 0:
+            print(f"\n--- Restarting episode (attempt {attempt + 1}/{max_tries}) ---")
+            
+        if args.source is not None:
+            source = CubePose(x=args.source[0], y=args.source[1], z=CUBE_HALF_SIZE)
+        else:
+            source = _get_tracked_cube(args.camera, args.camera_name)
+            if source is None:
+                raise SystemExit("Error: Could not track the cube and no --source was provided.")
+        target = (
+            CubePose(x=args.target[0], y=args.target[1], z=CUBE_HALF_SIZE)
+            if args.target is not None
+            else None
+        )
+
+        episode = prepare_episode(
+            np.random.default_rng(),
+            source,
+            target,
+            verbose=True,
+            include_environment=args.environment,
+        )
+
+        from pick_and_place.camera_extrinsics import apply_camera_extrinsics_to_model, load_local_camera_extrinsics
+        import mujoco
+        apply_camera_extrinsics_to_model(episode.model, load_local_camera_extrinsics())
+        mujoco.mj_forward(episode.model, episode.data)
+
+        restart = execute_episode(
+            episode,
+            follower_port=args.follower_port,
+            follower_id=args.follower_id,
+            offsets_path=args.offsets_path,
+            record_path=args.record_path,
+            speed=args.speed,
+            wrist_camera=args.wrist_camera,
+            wrist_intrinsics=args.wrist_intrinsics,
+            show_wrist_cam=args.show_wrist_cam,
+            show_wrist_mixed=args.show_wrist_mixed,
+        )
+        if not restart:
+            break
     else:
-        source = _get_tracked_cube(args.camera, args.camera_name)
-        if source is None:
-            raise SystemExit("Error: Could not track the cube and no --source was provided.")
-    target = (
-        CubePose(x=args.target[0], y=args.target[1], z=CUBE_HALF_SIZE)
-        if args.target is not None
-        else None
-    )
-
-    episode = prepare_episode(
-        np.random.default_rng(),
-        source,
-        target,
-        verbose=True,
-        include_environment=args.environment,
-    )
-
-    from pick_and_place.camera_extrinsics import apply_camera_extrinsics_to_model, load_local_camera_extrinsics
-    import mujoco
-    apply_camera_extrinsics_to_model(episode.model, load_local_camera_extrinsics())
-    mujoco.mj_forward(episode.model, episode.data)
-
-    execute_episode(
-        episode,
-        follower_port=args.follower_port,
-        follower_id=args.follower_id,
-        offsets_path=args.offsets_path,
-        record_path=args.record_path,
-        speed=args.speed,
-        wrist_camera=args.wrist_camera,
-        wrist_intrinsics=args.wrist_intrinsics,
-        show_wrist_cam=args.show_wrist_cam,
-        show_wrist_mixed=args.show_wrist_mixed,
-    )
+        print(f"\nFailed to complete episode after {max_tries} attempts. Aborting.")
 
 
 if __name__ == "__main__":

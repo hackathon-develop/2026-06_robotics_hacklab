@@ -34,7 +34,7 @@ from pick_and_place.follower import (
     real_frame_to_sim,
     sim_frame_to_real,
 )
-from pick_and_place.trajectory import replan_remaining_phases, REST_ARM_JOINTS, REST_GRIPPER
+from pick_and_place.trajectory import replan_remaining_phases, REST_ARM_JOINTS, REST_GRIPPER, NEUTRAL_ARM_JOINTS, NEUTRAL_GRIPPER
 from pick_and_place.kinematics import So101Kinematics
 
 
@@ -208,7 +208,7 @@ def execute_episode(
     wrist_intrinsics: str | None = None,
     show_wrist_cam: bool = False,
     show_wrist_mixed: bool = False,
-) -> None:
+) -> bool:
     """Stream a prepared episode's trajectory to the physical follower for one pass.
 
     Opens the viewer at the start pose, ramps the real arm onto it, then steps the
@@ -574,7 +574,7 @@ def execute_episode(
                 measured_joints, measured_gripper = real_frame_to_sim(actual, offsets)
                 
                 print(f"Replanning remaining trajectory after {completed_phase_name}...")
-                current_traj = replan_remaining_phases(
+                candidate_traj = replan_remaining_phases(
                     kinematics,
                     measured_joints,
                     measured_gripper,
@@ -586,18 +586,63 @@ def execute_episode(
                     episode.end_gripper,
                 )
                 
-                if current_traj is None:
-                    print("Error: No feasible plan from current state. Aborting.")
-                    break
-                    
-                # Preflight the newly planned remaining trajectory
-                events = _preflight(model, current_traj, actuator_id, robot_geom_ids, env_geom_ids)
-                unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
-                if unexpected:
-                    print("Error: Replanned segment failed preflight. Aborting.")
+                if candidate_traj is None:
+                    print("Error: No feasible plan from current state. Aborting and restarting from scratch.")
+                    restart_needed = True
+                else:
+                    # Preflight the newly planned remaining trajectory
+                    events = _preflight(model, candidate_traj, actuator_id, robot_geom_ids, env_geom_ids)
+                    unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
+                    if not unexpected:
+                        current_traj = candidate_traj
+                        continue # Success!
+                        
+                    print("Error: Replanned segment failed preflight. Aborting and restarting from scratch.")
                     for t, n1, n2 in unexpected:
                         print(f"  collision t={t:.3f}s {n1} ↔ {n2}")
-                    break
+                    restart_needed = True
+                
+                if restart_needed:
+                    print("Opening gripper before returning to NEUTRAL...")
+                    actual = action_to_joints(follower.get_observation(), commanded)
+                    actual_sim_joints, _ = real_frame_to_sim(actual, offsets)
+                    
+                    open_gripper_real = _clamp_and_warn(
+                        sim_frame_to_real(actual_sim_joints, NEUTRAL_GRIPPER, offsets),
+                        clamp_low,
+                        clamp_high,
+                        clip_warned,
+                    )
+                    _ramp_to_resting(
+                        follower,
+                        open_gripper_real,
+                        actual_sim_joints,
+                        NEUTRAL_GRIPPER,
+                        actuator_id,
+                        model,
+                        data,
+                        viewer,
+                    )
+                    
+                    print("Returning to NEUTRAL...")
+                    neutral_real = _clamp_and_warn(
+                        sim_frame_to_real(NEUTRAL_ARM_JOINTS, NEUTRAL_GRIPPER, offsets),
+                        clamp_low,
+                        clamp_high,
+                        clip_warned,
+                    )
+                    _ramp_to_resting(
+                        follower,
+                        neutral_real,
+                        NEUTRAL_ARM_JOINTS,
+                        NEUTRAL_GRIPPER,
+                        actuator_id,
+                        model,
+                        data,
+                        viewer,
+                    )
+                    return True # Instructs caller to restart
+
                     
             if viewer.is_running():
                 print("Ramping real arm back to the resting pose...")
@@ -635,3 +680,6 @@ def execute_episode(
             cv2.destroyAllWindows()
         if wrist_renderer is not None:
             wrist_renderer.close()
+
+    return False
+
