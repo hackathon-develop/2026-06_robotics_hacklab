@@ -156,7 +156,7 @@ def _cartesian_move_duration(distance: float) -> float:
 # Cube-center height of the level cruise. Above the predrop hover (2 cm) so the
 # cube genuinely rises then descends; clears the cube top with room to spare
 # mid-traverse.
-CARRY_CRUISE_Z = 0.03
+CARRY_CRUISE_Z = 0.08
 # The side-view carry is one C2 spline through four waypoints: leave the pick
 # vertically, round into a level cruise, hold the cruise, round down and arrive
 # vertically. The waypoint phases below place the cruise in the middle 20 %.

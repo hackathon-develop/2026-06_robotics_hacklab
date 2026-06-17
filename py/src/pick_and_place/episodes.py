@@ -95,6 +95,21 @@ def set_joint(model: mujoco.MjModel, data: mujoco.MjData, name: str, value: floa
     data.qpos[model.jnt_qposadr[jid]] = value
 
 
+def set_cube_pose(model: mujoco.MjModel, data: mujoco.MjData, source: CubePose) -> None:
+    """Move the freejoint ``pick_cube`` to ``source`` in an existing model's data.
+
+    Lets a single persistent model be reused across episodes (so a live viewer can
+    stay bound to it) instead of recompiling one per cube pose."""
+    cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pick_cube")
+    jnt_adr = model.body_jntadr[cube_body_id]
+    qpos_adr = model.jnt_qposadr[jnt_adr]
+    qvel_adr = model.jnt_dofadr[jnt_adr]
+    data.qpos[qpos_adr:qpos_adr + 3] = (source.x, source.y, source.z)
+    half_yaw = source.yaw / 2.0
+    data.qpos[qpos_adr + 3:qpos_adr + 7] = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+    data.qvel[qvel_adr:qvel_adr + 6] = 0.0
+
+
 def build_geom_sets(model: mujoco.MjModel) -> tuple[set[int], set[int]]:
     """Return (robot_geom_ids, env_geom_ids).
 
@@ -258,6 +273,10 @@ def prepare_episode(
     source: CubePose | None = None,
     target: CubePose | None = None,
     *,
+    start_joints: dict[str, float] | None = None,
+    start_gripper: float | None = None,
+    model: mujoco.MjModel | None = None,
+    data: mujoco.MjData | None = None,
     max_attempts: int | None = None,
     verbose: bool = False,
     include_environment: bool = False,
@@ -267,13 +286,20 @@ def prepare_episode(
     """Sample poses and return the first collision-free pick-and-carry.
 
     ``source``/``target`` pin those cube poses (otherwise they are resampled
-    each attempt); the start/end arm poses are always sampled fresh. With both
-    poses pinned and no feasible trajectory, raises immediately. Otherwise keeps
-    resampling until success or, if ``max_attempts`` is set, that many attempts
-    fail — then raises :class:`EpisodeSamplingError`.
+    each attempt). The start arm pose is sampled fresh each attempt unless
+    ``start_joints``/``start_gripper`` pin it (e.g. to the real arm's current
+    pose); the end pose is always sampled fresh. Pass ``model``/``data`` to reuse
+    a single persistent scene (its ``pick_cube`` freejoint is moved to ``source``)
+    instead of compiling a fresh model each attempt — required so a live viewer can
+    stay bound across episodes. With the cube and start poses all pinned and no
+    feasible trajectory, raises immediately. Otherwise keeps resampling until
+    success or, if ``max_attempts`` is set, that many attempts fail — then raises
+    :class:`EpisodeSamplingError`.
     """
     fixed_source = source is not None
     fixed_target = target is not None
+    fixed_start = start_joints is not None
+    reuse_model = model is not None
 
     attempt = 0
     while max_attempts is None or attempt < max_attempts:
@@ -281,44 +307,58 @@ def prepare_episode(
 
         ep_source = source if fixed_source else sample_cube(rng)
         ep_target = target if fixed_target else sample_cube(rng)
-        start_joints, start_gripper = sample_near_neutral(rng)
+        if fixed_start:
+            ep_start_joints, ep_start_gripper = dict(start_joints), float(start_gripper)
+        else:
+            ep_start_joints, ep_start_gripper = sample_near_neutral(rng)
         end_joints, end_gripper = sample_near_neutral(rng)
 
-        model, data = _build_model(
-            ep_source, 
-            include_environment=include_environment, 
-            offwidth=offwidth, 
-            offheight=offheight
-        )
-        kinematics = derive_kinematics(model)
+        if reuse_model:
+            ep_model, ep_data = model, data
+            set_cube_pose(ep_model, ep_data, ep_source)
+        else:
+            ep_model, ep_data = _build_model(
+                ep_source,
+                include_environment=include_environment,
+                offwidth=offwidth,
+                offheight=offheight,
+            )
+        kinematics = derive_kinematics(ep_model)
         actuator_id = {
-            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i): i for i in range(model.nu)
+            mujoco.mj_id2name(ep_model, mujoco.mjtObj.mjOBJ_ACTUATOR, i): i for i in range(ep_model.nu)
         }
-        for name, value in start_joints.items():
-            set_joint(model, data, name, value)
-            data.ctrl[actuator_id[name]] = value
+        for name, value in ep_start_joints.items():
+            set_joint(ep_model, ep_data, name, value)
+            ep_data.ctrl[actuator_id[name]] = value
         # Initialise the gripper qpos too, not just its target: otherwise it
         # starts at the model default (closed) and the servo snaps it open on the
         # first step, polluting the viewer and the recorded state with a fake jerk.
-        set_joint(model, data, "gripper", start_gripper)
-        data.ctrl[actuator_id["gripper"]] = start_gripper
-        mujoco.mj_forward(model, data)
+        set_joint(ep_model, ep_data, "gripper", ep_start_gripper)
+        ep_data.ctrl[actuator_id["gripper"]] = ep_start_gripper
+        # Clear any residual velocity left in a reused scene from a prior episode.
+        ep_data.qvel[:] = 0.0
+        mujoco.mj_forward(ep_model, ep_data)
 
         # Reject start poses that sit on or too near the floor before spending a
-        # trajectory search on them — the arm must begin in the air. (The start
-        # arm pose is resampled every attempt, so retrying is always meaningful.)
-        clearance = jaw_floor_clearance(model, data, jaw_geom_ids(model))
+        # trajectory search on them — the arm must begin in the air. When the start
+        # pose is pinned (the real arm's current pose) it can't be resampled, so we
+        # only warn and carry on.
+        clearance = jaw_floor_clearance(ep_model, ep_data, jaw_geom_ids(ep_model))
         if clearance < MIN_START_CLEARANCE:
-            if verbose:
-                print(f"attempt {attempt}: start jaw clearance {clearance:.3f}m too low, resampling...")
-            continue
+            if fixed_start:
+                if verbose:
+                    print(f"attempt {attempt}: pinned start jaw clearance {clearance:.3f}m below {MIN_START_CLEARANCE}m, proceeding")
+            else:
+                if verbose:
+                    print(f"attempt {attempt}: start jaw clearance {clearance:.3f}m too low, resampling...")
+                continue
 
-        robot_geom_ids, env_geom_ids = build_geom_sets(model)
+        robot_geom_ids, env_geom_ids = build_geom_sets(ep_model)
 
         trajectory = None
-        for traj in trajectory_candidates(kinematics, ep_source, ep_target, start_joints, start_gripper, end_joints, end_gripper):
+        for traj in trajectory_candidates(kinematics, ep_source, ep_target, ep_start_joints, ep_start_gripper, end_joints, end_gripper):
             grasp = traj.grasp
-            events = _preflight(model, traj, actuator_id, robot_geom_ids, env_geom_ids)
+            events = _preflight(ep_model, traj, actuator_id, robot_geom_ids, env_geom_ids)
             unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
             if not unexpected:
                 trajectory = traj
@@ -346,12 +386,12 @@ def prepare_episode(
             return Episode(
                 source=ep_source,
                 target=ep_target,
-                start_joints=start_joints,
-                start_gripper=start_gripper,
+                start_joints=ep_start_joints,
+                start_gripper=ep_start_gripper,
                 end_joints=end_joints,
                 end_gripper=end_gripper,
-                model=model,
-                data=data,
+                model=ep_model,
+                data=ep_data,
                 kinematics=kinematics,
                 actuator_id=actuator_id,
                 robot_geom_ids=robot_geom_ids,
