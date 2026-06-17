@@ -15,6 +15,7 @@ report doubles as a sim→real calibration measurement.
 
 This is the analytic hardware path. For sim-only playback (no arm) use
 ``view_trajectory``; learned policies live under ``pick_and_place.il`` / ``.rl``.
+
 """
 
 from __future__ import annotations
@@ -193,6 +194,11 @@ def main() -> None:
         action="store_true",
         help="Show live feed from the wrist camera in an OpenCV window"
     )
+    parser.add_argument(
+        "--show-wrist-mixed",
+        action="store_true",
+        help="Render the full 3D MuJoCo scene over the wrist camera feed (slower, for debugging)"
+    )
     args = parser.parse_args()
 
     if args.source is not None:
@@ -230,6 +236,7 @@ def main() -> None:
         wrist_camera=args.wrist_camera,
         wrist_intrinsics=args.wrist_intrinsics,
         show_wrist_cam=args.show_wrist_cam,
+        show_wrist_mixed=args.show_wrist_mixed,
     )
 
 

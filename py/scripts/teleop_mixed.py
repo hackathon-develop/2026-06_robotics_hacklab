@@ -118,6 +118,31 @@ def _draw_cube_wireframe(bgr: np.ndarray, data: mujoco.MjData, camera_id: int, c
             cv2.line(bgr, p1, p2, (0, 255, 0), 2, cv2.LINE_AA)
 
 
+def _draw_tcp_dot(bgr: np.ndarray, data: mujoco.MjData, camera_id: int, camera_matrix: np.ndarray) -> None:
+    """Project the gripper TCP (JAW_CONTACT_POSITION) into the camera and draw a red dot."""
+    gripper_id = mujoco.mj_name2id(data.model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
+    if gripper_id < 0 or camera_id < 0:
+        return
+
+    from pick_and_place.geometry import JAW_CONTACT_POSITION
+    gripper_pos = data.xpos[gripper_id]
+    gripper_mat = data.xmat[gripper_id].reshape(3, 3)
+    tcp_world = gripper_pos + gripper_mat @ JAW_CONTACT_POSITION
+
+    cam_pos = data.cam_xpos[camera_id]
+    cam_mat = data.cam_xmat[camera_id].reshape(3, 3)
+    
+    tcp_cam_mj = cam_mat.T @ (tcp_world - cam_pos)
+    tcp_cam_cv = np.array([tcp_cam_mj[0], -tcp_cam_mj[1], -tcp_cam_mj[2]])
+
+    if tcp_cam_cv[2] > 0.01:
+        uv = tcp_cam_cv[:2] / tcp_cam_cv[2]
+        uv_px = camera_matrix @ np.array([uv[0], uv[1], 1.0])
+        px = (int(uv_px[0]), int(uv_px[1]))
+        cv2.circle(bgr, px, 4, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(bgr, px, 4, (255, 255, 255), 1, cv2.LINE_AA)
+
+
 
 @dataclass
 class TeleopState:
@@ -537,11 +562,17 @@ def main() -> None:
                 if w_rect_matrix is not None and w_camera_id >= 0 and cube_status is not None and not cube_status.endswith("no tags"):
                     _draw_cube_wireframe(wrist_out, data, w_camera_id, w_rect_matrix)
                 
+                if w_rect_matrix is not None and w_camera_id >= 0:
+                    _draw_tcp_dot(wrist_out, data, w_camera_id, w_rect_matrix)
+                
                 wrist_out = draw_hud(wrist_out, mode=mode, alpha=alpha, intrinsics=wrist_intrinsics_path)
             else:
                 wrist_bgr = cv2.cvtColor(wrist_sim, cv2.COLOR_RGB2BGR)
                 if w_rect_matrix is not None and w_camera_id >= 0 and cube_status is not None and not cube_status.endswith("no tags"):
                     _draw_cube_wireframe(wrist_bgr, data, w_camera_id, w_rect_matrix)
+                
+                if w_rect_matrix is not None and w_camera_id >= 0:
+                    _draw_tcp_dot(wrist_bgr, data, w_camera_id, w_rect_matrix)
 
             if has_overhead and sim is not None and frame is not None:
                 if mode == "edges":

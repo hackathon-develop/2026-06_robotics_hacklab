@@ -207,6 +207,7 @@ def execute_episode(
     wrist_camera: str | None = None,
     wrist_intrinsics: str | None = None,
     show_wrist_cam: bool = False,
+    show_wrist_mixed: bool = False,
 ) -> None:
     """Stream a prepared episode's trajectory to the physical follower for one pass.
 
@@ -263,6 +264,7 @@ def execute_episode(
     last_processed_id = -1
     cam_running = False
     cam_thread = None
+    wrist_renderer = None
 
     if wrist_camera is not None and wrist_cam_id >= 0:
         import cv2
@@ -289,11 +291,22 @@ def execute_episode(
             if intrinsics_path.exists():
                 from pick_and_place.camera_compare import load_intrinsics
                 wrist_camera_matrix, wrist_undistort_map = load_intrinsics(intrinsics_path, 1280, 720, cv2)
+                rect_fy = float(wrist_camera_matrix[1, 1])
+                model.cam_fovy[wrist_cam_id] = float(np.degrees(2.0 * np.arctan((720 / 2.0) / rect_fy)))
             else:
                 focal = (720 / 2.0) / np.tan(np.radians(model.cam_fovy[wrist_cam_id]) / 2.0)
                 wrist_camera_matrix = np.array(
                     [[focal, 0, 1280 / 2.0], [0, focal, 720 / 2.0], [0, 0, 1]], dtype=float
                 )
+
+            if show_wrist_mixed:
+                render_w, render_h = 1280, 720
+                max_w = int(model.vis.global_.offwidth)
+                max_h = int(model.vis.global_.offheight)
+                scale = min(1.0, max_w / render_w, max_h / render_h)
+                rw = max(1, int(round(render_w * scale)))
+                rh = max(1, int(round(render_h * scale)))
+                wrist_renderer = mujoco.Renderer(model, width=rw, height=rh)
 
             import threading
             cam_lock = threading.Lock()
@@ -315,7 +328,7 @@ def execute_episode(
     prev_contacts: set[tuple[str, str]] = set()
     try:
         import sys
-        disable_viewer = show_wrist_cam and sys.platform == "darwin"
+        disable_viewer = (show_wrist_cam or show_wrist_mixed) and sys.platform == "darwin"
         
         class MockViewer:
             def __init__(self):
@@ -356,7 +369,7 @@ def execute_episode(
                 playback_start = data.time
                 
                 # Setup PBVS dynamically updating current source
-                from pick_and_place.trajectory import DescentPhase
+                from pick_and_place.trajectory import DescentPhase, _shortest_delta
                 from pick_and_place.geometry import CubePose, CUBE_HALF_SIZE
                 from scipy.spatial.transform import Rotation
                 import dataclasses
@@ -369,7 +382,7 @@ def execute_episode(
                     phase_t = (data.time - playback_start) * speed
                     
                     bgr = None
-                    if wrist_cam is not None and (show_wrist_cam or is_descent):
+                    if wrist_cam is not None and (show_wrist_cam or show_wrist_mixed or is_descent):
                         with cam_lock:
                             if cam_frame is not None and cam_frame_id != last_processed_id:
                                 last_processed_id = cam_frame_id
@@ -418,6 +431,22 @@ def execute_episode(
                                 for i, j in edges:
                                     cv2.line(bgr, tuple(pts_img[i]), tuple(pts_img[j]), (0, 165, 255), 2, cv2.LINE_AA)
                                     
+                                # Draw TCP dot
+                                gripper_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
+                                if gripper_id >= 0:
+                                    from pick_and_place.geometry import JAW_CONTACT_POSITION
+                                    gripper_pos = data.xpos[gripper_id]
+                                    gripper_mat = data.xmat[gripper_id].reshape(3, 3)
+                                    tcp_world = gripper_pos + gripper_mat @ JAW_CONTACT_POSITION
+                                    tcp_cam_mj = cam_rot.T @ (tcp_world - cam_pos)
+                                    tcp_cam_cv = np.array([tcp_cam_mj[0], -tcp_cam_mj[1], -tcp_cam_mj[2]])
+                                    if tcp_cam_cv[2] > 0.01:
+                                        uv = tcp_cam_cv[:2] / tcp_cam_cv[2]
+                                        uv_px = wrist_camera_matrix @ np.array([uv[0], uv[1], 1.0])
+                                        px = (int(uv_px[0]), int(uv_px[1]))
+                                        cv2.circle(bgr, px, 4, (0, 0, 255), -1, cv2.LINE_AA)
+                                        cv2.circle(bgr, px, 4, (255, 255, 255), 1, cv2.LINE_AA)
+                                    
                                 roll, pitch, yaw = Rotation.from_matrix(estimate.rotation).as_euler("xyz")
                                 new_source = CubePose(
                                     x=float(estimate.position[0]),
@@ -427,12 +456,43 @@ def execute_episode(
                                     pitch=0.0,
                                     yaw=float(yaw)
                                 )
-                                phase = dataclasses.replace(phase, source=new_source)
-                                dynamic_source = new_source
+                                
+                                # Smoothly interpolate target to avoid arm jumps
+                                alpha = 0.1
+                                smoothed_x = dynamic_source.x * (1 - alpha) + new_source.x * alpha
+                                smoothed_y = dynamic_source.y * (1 - alpha) + new_source.y * alpha
+                                smoothed_yaw = dynamic_source.yaw + _shortest_delta(dynamic_source.yaw, new_source.yaw) * alpha
+                                
+                                smoothed_source = dataclasses.replace(
+                                    new_source, x=smoothed_x, y=smoothed_y, yaw=smoothed_yaw
+                                )
+                                phase = dataclasses.replace(phase, source=smoothed_source)
+                                dynamic_source = smoothed_source
+                                
+                                # Update simulated cube to match camera detection
+                                cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pick_cube")
+                                if cube_body_id >= 0:
+                                    jnt_adr = model.body_jntadr[cube_body_id]
+                                    if jnt_adr >= 0 and model.jnt_type[jnt_adr] == mujoco.mjtJoint.mjJNT_FREE:
+                                        qpos_adr = model.jnt_qposadr[jnt_adr]
+                                        qvel_adr = model.jnt_dofadr[jnt_adr]
+                                        data.qpos[qpos_adr:qpos_adr+3] = [new_source.x, new_source.y, new_source.z]
+                                        half_yaw = new_source.yaw / 2.0
+                                        data.qpos[qpos_adr+3:qpos_adr+7] = [math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)]
+                                        data.qvel[qvel_adr:qvel_adr+6] = 0.0
 
-                        if bgr is not None and show_wrist_cam:
+                        if bgr is not None and (show_wrist_cam or show_wrist_mixed):
                             if wrist_undistort_map is not None and not is_descent:
                                 bgr = cv2.remap(bgr, *wrist_undistort_map, cv2.INTER_LINEAR)
+                                
+                            if wrist_renderer is not None:
+                                wrist_renderer.update_scene(data, camera="wrist_camera")
+                                sim_rgb = wrist_renderer.render()
+                                sim_bgr = cv2.cvtColor(sim_rgb, cv2.COLOR_RGB2BGR)
+                                if sim_bgr.shape[:2] != bgr.shape[:2]:
+                                    sim_bgr = cv2.resize(sim_bgr, (bgr.shape[1], bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
+                                bgr = cv2.addWeighted(bgr, 0.6, sim_bgr, 0.4, 0.0)
+
                             cv2.imshow("Wrist Cam", bgr)
                             cv2.waitKey(1)
 
@@ -477,6 +537,26 @@ def execute_episode(
                     break
                     
                 completed_phase_name = phase.name
+                
+                if completed_phase_name == "grasp":
+                    gripper_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
+                    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pick_cube")
+                    if gripper_id >= 0 and cube_id >= 0:
+                        from pick_and_place.geometry import JAW_CONTACT_POSITION
+                        g_pos = data.xpos[gripper_id]
+                        g_mat = data.xmat[gripper_id].reshape(3, 3)
+                        tcp_world = g_pos + g_mat @ JAW_CONTACT_POSITION
+                        
+                        c_pos = data.xpos[cube_id]
+                        c_mat = data.xmat[cube_id].reshape(3, 3)
+                        tcp_cube = c_mat.T @ (tcp_world - c_pos)
+                        
+                        print("\n--- GRASP DIAGNOSTICS ---")
+                        print("TCP position in cube local frame:")
+                        print(f"  x={tcp_cube[0]*1000:+.1f} mm")
+                        print(f"  y={tcp_cube[1]*1000:+.1f} mm")
+                        print(f"  z={tcp_cube[2]*1000:+.1f} mm")
+                        print("-------------------------\n")
                 
                 if completed_phase_name == "descent" and isinstance(phase, DescentPhase):
                     from pick_and_place.trajectory import grasp_candidates
@@ -550,6 +630,8 @@ def execute_episode(
             if cam_thread is not None:
                 cam_thread.join(timeout=1.0)
             wrist_cam.release()
-        if show_wrist_cam:
+        if show_wrist_cam or show_wrist_mixed:
             import cv2
             cv2.destroyAllWindows()
+        if wrist_renderer is not None:
+            wrist_renderer.close()

@@ -38,8 +38,13 @@ JAW_CONTACT_POSITION = np.array(
     (_TIP_BOX_POS[0] + _TIP_BOX_SIZE[0] + _MARKER_SURFACE_OFFSET, 0.0, _TIP_BOX_POS[2])
 )
 
-# Cube contact point: center of the +x face, nudged out by the marker offset.
-CUBE_CONTACT_POSITION = np.array((CUBE_HALF_SIZE + _MARKER_SURFACE_OFFSET, 0.0, 0.0))
+# Jaw vertical offset from the vertical center of the cube (in meters).
+# A negative value shifts the grip lower on the cube (e.g., -0.005 grips 5mm lower).
+GRIP_Z_OFFSET = -0.005
+
+# Cube contact point: center of the +x face, nudged out by the marker offset,
+# and shifted vertically by GRIP_Z_OFFSET.
+CUBE_CONTACT_POSITION = np.array((CUBE_HALF_SIZE + _MARKER_SURFACE_OFFSET, 0.0, GRIP_Z_OFFSET))
 
 # IK position target: jaw contact projected onto the wrist-roll axis. The offset
 # from contact to here runs along gripper x, so wrist roll leaves it invariant.
