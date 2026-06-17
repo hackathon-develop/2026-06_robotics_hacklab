@@ -44,6 +44,15 @@ def main() -> None:
         action="store_true",
         help="include the calibration workspace_frame and overhead camera mount in the scene",
     )
+    parser.add_argument(
+        "--apriltag-cube",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "use the AprilTag-stickered pick cube (perception target) instead of "
+            "the plain red cube; defaults to on with --environment, off otherwise"
+        ),
+    )
     args = parser.parse_args()
 
     if args.export_only and args.export is None:
@@ -55,12 +64,14 @@ def main() -> None:
             args.export,
             wrist_camera=wrist_camera,
             include_environment=args.environment,
+            apriltag_cube=args.apriltag_cube,
         )
         print(f"Wrote {output}")
     if not args.export_only:
         model = build_scene(
             wrist_camera=wrist_camera,
             include_environment=args.environment,
+            apriltag_cube=args.apriltag_cube,
         ).compile()
         data = mujoco.MjData(model)
 
