@@ -56,6 +56,7 @@ from pick_and_place.follower import (
 )
 from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
 from pick_and_place.kinematics import derive_kinematics
+from pick_and_place.safety import EpisodeAborted, recover_on
 from pick_and_place.trajectory import (
     GRIPPER_OPEN,
     NEUTRAL_ARM_JOINTS,
@@ -336,6 +337,22 @@ def main() -> None:
         arm, grip = sample_near_neutral(rng)
         move_to(arm, grip, viewer)
 
+    def park_from_interrupt() -> None:
+        """User ended the loop: park to NEUTRAL, then REST. The real viewer has
+        already been torn down by the `with`, so park against a mock one. Make
+        sure torque is on first — a Ctrl-C during the cooldown sleep leaves it
+        off, and parking commands would be ignored by a limp arm."""
+        nonlocal ended_at_rest
+        print("\nCtrl-C: parking to NEUTRAL then REST...")
+        try:
+            follower.bus.enable_torque()
+        except Exception as exc:  # noqa: BLE001 - best-effort re-enable before parking
+            print(f"Warning: could not enable torque before parking: {exc}")
+        park = MockViewer()
+        move_to(NEUTRAL_ARM_JOINTS, NEUTRAL_GRIPPER, park)
+        move_to(REST_ARM_JOINTS, REST_GRIPPER, park)
+        ended_at_rest = True
+
     def hunt_for_cube(viewer) -> CubePose | None:
         """Look for the cube from the current pose, re-homing near neutral up to
         ``--max-hunt-tries`` times. Returns the cube pose or ``None`` if not found."""
@@ -363,90 +380,78 @@ def main() -> None:
 
     ended_at_rest = False
     try:
-        with viewer_ctx as viewer:
-            print("Homing to near-neutral...")
-            arm, grip = sample_near_neutral(rng)
-            move_to(arm, grip, viewer)
+        with recover_on(KeyboardInterrupt, recover=park_from_interrupt):
+            with viewer_ctx as viewer:
+                print("Homing to near-neutral...")
+                arm, grip = sample_near_neutral(rng)
+                move_to(arm, grip, viewer)
 
-            episodes_done = 0
-            episode_attempt = 0
-            while (args.episodes == 0 or episodes_done < args.episodes) and viewer.is_running():
-                source = hunt_for_cube(viewer)
-                if not viewer.is_running():
-                    break
-                if source is None:
-                    print(f"Cube not found after {args.max_hunt_tries} looks. Ending loop.")
-                    break
+                episodes_done = 0
+                episode_attempt = 0
+                while (args.episodes == 0 or episodes_done < args.episodes) and viewer.is_running():
+                    source = hunt_for_cube(viewer)
+                    if not viewer.is_running():
+                        break
+                    if source is None:
+                        print(f"Cube not found after {args.max_hunt_tries} looks. Ending loop.")
+                        break
 
-                current_joints, current_gripper = read_current_sim_pose()
-                try:
-                    episode = prepare_episode(
-                        rng,
-                        source,
-                        fixed_target,
-                        start_joints=current_joints,
-                        start_gripper=current_gripper,
-                        model=model,
-                        data=data,
-                        max_attempts=EPISODE_MAX_ATTEMPTS,
-                        verbose=True,
-                        include_environment=args.environment,
-                    )
-                except EpisodeSamplingError:
-                    print("No feasible plan from the current pose.")
-                    abort_to_near_neutral(viewer)
-                    continue
+                    current_joints, current_gripper = read_current_sim_pose()
+                    with recover_on(
+                        EpisodeSamplingError, EpisodeAborted,
+                        recover=lambda: abort_to_near_neutral(viewer),
+                    ):
+                        try:
+                            episode = prepare_episode(
+                                rng,
+                                source,
+                                fixed_target,
+                                start_joints=current_joints,
+                                start_gripper=current_gripper,
+                                model=model,
+                                data=data,
+                                max_attempts=EPISODE_MAX_ATTEMPTS,
+                                verbose=True,
+                                include_environment=args.environment,
+                            )
+                        except EpisodeSamplingError:
+                            print("No feasible plan from the current pose.")
+                            raise
 
-                episode_attempt += 1
-                print(f"\n--- Episode {episodes_done + 1}"
-                      f"{f'/{args.episodes}' if args.episodes else ''} ---")
-                episode_base_name = f"episode_{episode_attempt:03d}"
-                status = execute_episode(
-                    episode,
-                    follower=follower,
-                    viewer=viewer,
-                    offsets_path=args.offsets_path,
-                    record_path=str(record_dir_path / f"{episode_base_name}.npz"),
-                    video_dir=record_dir_path,
-                    video_base_name=episode_base_name,
-                    overhead_camera_cap=overhead_cap,
-                    speed=args.speed,
-                    wrist_camera=args.wrist_camera,
-                    wrist_intrinsics=args.wrist_intrinsics,
-                    show_wrist_cam=args.show_wrist_cam,
-                    show_wrist_mixed=args.show_wrist_mixed,
-                )
+                        episode_attempt += 1
+                        print(f"\n--- Episode {episodes_done + 1}"
+                              f"{f'/{args.episodes}' if args.episodes else ''} ---")
+                        episode_base_name = f"episode_{episode_attempt:03d}"
+                        status = execute_episode(
+                            episode,
+                            follower=follower,
+                            viewer=viewer,
+                            offsets_path=args.offsets_path,
+                            record_path=str(record_dir_path / f"{episode_base_name}.npz"),
+                            video_dir=record_dir_path,
+                            video_base_name=episode_base_name,
+                            overhead_camera_cap=overhead_cap,
+                            speed=args.speed,
+                            wrist_camera=args.wrist_camera,
+                            wrist_intrinsics=args.wrist_intrinsics,
+                            show_wrist_cam=args.show_wrist_cam,
+                            show_wrist_mixed=args.show_wrist_mixed,
+                        )
 
-                if status == "restart":
-                    abort_to_near_neutral(viewer)
-                    continue
+                        if status == "restart":
+                            raise EpisodeAborted
 
-                episodes_done += 1
-                is_last = args.episodes != 0 and episodes_done >= args.episodes
-                if not is_last and args.rest_every > 0 and episodes_done % args.rest_every == 0:
-                    cooldown(viewer)
+                        episodes_done += 1
+                        is_last = args.episodes != 0 and episodes_done >= args.episodes
+                        if not is_last and args.rest_every > 0 and episodes_done % args.rest_every == 0:
+                            cooldown(viewer)
 
-            # Normal end (episode budget met, cube lost, or viewer closed): the arm
-            # is at the last near-neutral pose — flow it straight to REST.
-            if viewer.is_running():
-                print("Loop done. Moving to REST...")
-                move_to(REST_ARM_JOINTS, REST_GRIPPER, viewer)
-                ended_at_rest = True
-
-    except KeyboardInterrupt:
-        # User ended the loop: park to NEUTRAL, then REST. The real viewer has
-        # already been torn down by the `with`, so park against a mock one. Make
-        # sure torque is on first — a Ctrl-C during the cooldown sleep leaves it
-        # off, and parking commands would be ignored by a limp arm.
-        print("\nCtrl-C: parking to NEUTRAL then REST...")
-        try:
-            follower.bus.enable_torque()
-        except Exception as exc:  # noqa: BLE001 - best-effort re-enable before parking
-            print(f"Warning: could not enable torque before parking: {exc}")
-        park = MockViewer()
-        move_to(NEUTRAL_ARM_JOINTS, NEUTRAL_GRIPPER, park)
-        move_to(REST_ARM_JOINTS, REST_GRIPPER, park)
-        ended_at_rest = True
+                # Normal end (episode budget met, cube lost, or viewer closed): the
+                # arm is at the last near-neutral pose — flow it straight to REST.
+                if viewer.is_running():
+                    print("Loop done. Moving to REST...")
+                    move_to(REST_ARM_JOINTS, REST_GRIPPER, viewer)
+                    ended_at_rest = True
     finally:
         if ended_at_rest:
             print("At REST — releasing torque.")
