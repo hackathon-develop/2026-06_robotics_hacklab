@@ -35,6 +35,7 @@ from pick_and_place.follower import (
 )
 from pick_and_place.trajectory import replan_remaining_phases
 from pick_and_place.kinematics import So101Kinematics
+from pick_and_place.recorder import EpisodeRecorder
 
 
 # Rate at which set points are streamed to the physical follower and the motors
@@ -159,13 +160,13 @@ def ramp_to_resting(
             time.sleep(remaining)
 
 
-def _report_tracking(log_rows: list[tuple[float, np.ndarray, np.ndarray]]) -> None:
+def _report_tracking(recorder: EpisodeRecorder) -> None:
     """Print a per-joint desired-vs-actual error summary over the recorded run."""
-    if not log_rows:
+    if len(recorder) == 0:
         print("No follower samples recorded.")
         return
-    commanded = np.array([row[1] for row in log_rows])
-    actual = np.array([row[2] for row in log_rows])
+    stacked = recorder.stacked()
+    t, commanded, actual = stacked["t"], stacked["commanded"], stacked["actual"]
     error = actual - commanded
     print("\nPer-joint tracking (actual − commanded):")
     print(f"  {'joint':<14}{'unit':<5}{'max|err|':>10}{'mean|err|':>11}{'mean err':>10}")
@@ -176,21 +177,18 @@ def _report_tracking(log_rows: list[tuple[float, np.ndarray, np.ndarray]]) -> No
             f"  {name:<14}{unit:<5}{np.max(np.abs(col)):>10.2f}"
             f"{np.mean(np.abs(col)):>11.2f}{np.mean(col):>10.2f}"
         )
-    print(f"  ({len(log_rows)} samples over {log_rows[-1][0]:.2f}s)")
+    print(f"  ({len(recorder)} samples over {t[-1]:.2f}s)")
     print("  (with zero offsets, a joint's mean err is its sim→real calibration bias)")
 
 
-def _write_record(path: str, log_rows: list[tuple[float, np.ndarray, np.ndarray]]) -> None:
+def _write_record(path: str, recorder: EpisodeRecorder) -> None:
     """Write the full per-tick commanded/actual log to npz (degrees; gripper position).
 
     Arrays: ``t`` (N,), ``commanded`` (N, J), ``actual`` (N, J), ``joint_names`` (J,)
     giving the column order of the last axis of ``commanded``/``actual``.
     """
-    t = np.array([row[0] for row in log_rows])
-    commanded = np.array([row[1] for row in log_rows])
-    actual = np.array([row[2] for row in log_rows])
-    np.savez_compressed(path, t=t, commanded=commanded, actual=actual, joint_names=np.array(JOINT_NAMES))
-    print(f"Wrote {len(log_rows)} samples to {path}")
+    recorder.save(path, joint_names=np.array(JOINT_NAMES))
+    print(f"Wrote {len(recorder)} samples to {path}")
 
 
 def _write_frame_index(path: str, rows: list[tuple[int, int | None, int | None]]) -> None:
@@ -279,7 +277,7 @@ def execute_episode(
     print(f"Playback speed: {speed:g}× nominal  (run ≈ {trajectory.duration / speed:.1f}s)")
 
     # Per-tick log of (trajectory time, commanded real joints, motor readback).
-    log_rows: list[tuple[float, np.ndarray, np.ndarray]] = []
+    recorder = EpisodeRecorder()
     control_period = 1.0 / CONTROL_HZ
     last_control_t = -math.inf
 
@@ -578,7 +576,7 @@ def execute_episode(
                     follower.send_action(joints_to_action(commanded))
                     actual = action_to_joints(follower.get_observation(), commanded)
                     # We log data.time so the overall timeline is continuous.
-                    log_rows.append((data.time, commanded, actual))
+                    recorder.log(t=data.time, commanded=commanded, actual=actual)
 
                     if video_dir is not None and data.time - last_synced_t >= record_period:
                         last_synced_t = data.time
@@ -587,7 +585,7 @@ def execute_episode(
                             with cam_lock:
                                 wrist_idx = cam_frame_id - 1 if cam_frame_id > 0 else None
                         overhead_idx = overhead_frame_count - 1 if overhead_frame_count > 0 else None
-                        synced_log.append((len(log_rows) - 1, wrist_idx, overhead_idx))
+                        synced_log.append((len(recorder) - 1, wrist_idx, overhead_idx))
 
                 viewer.sync()
                 
@@ -672,9 +670,9 @@ def execute_episode(
         print("\nInterrupted during episode.")
         raise
     finally:
-        _report_tracking(log_rows)
+        _report_tracking(recorder)
         if record_path is not None:
-            _write_record(record_path, log_rows)
+            _write_record(record_path, recorder)
         if video_dir is not None:
             frames_path = Path(video_dir) / f"{video_base_name or 'episode'}_frames.npz"
             _write_frame_index(str(frames_path), synced_log)

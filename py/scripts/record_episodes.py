@@ -35,6 +35,7 @@ from pick_and_place.episodes import (
 )
 from pick_and_place.follower import JOINT_NAMES
 from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
+from pick_and_place.recorder import EpisodeRecorder
 
 # Default rate at which the trajectory is sampled into the dataset (Hz). The sim
 # steps far faster; frames are emitted on this slower clock — the same cadence a
@@ -82,12 +83,15 @@ def _action_vector(frame) -> np.ndarray:
     return np.asarray(values, dtype=np.float64)
 
 
-def run_episode(episode: Episode, control_hz: float) -> dict[str, np.ndarray]:
+def run_episode(
+    episode: Episode, control_hz: float, out_path: Path, *, episode_index: int, seed: int
+) -> dict[str, np.ndarray]:
     """Step the prepared episode under physics, sampling the trajectory at
-    ``control_hz`` into per-frame ``action``/``state``/``qpos``/``qvel`` arrays.
+    ``control_hz`` into per-frame ``action``/``state``/``qpos``/``qvel`` arrays,
+    then save it (plus the start/end poses of the cube and robot and the
+    realized final cube pose) to ``out_path``.
 
-    Returns a dict of stacked arrays plus the start/end poses of the cube and
-    robot and the realized final cube pose, ready to hand to ``np.savez``.
+    Returns the dict that was saved.
     """
     model, data = episode.model, episode.data
     trajectory = episode.trajectory
@@ -96,11 +100,7 @@ def run_episode(episode: Episode, control_hz: float) -> dict[str, np.ndarray]:
     joint_adr = _joint_qpos_adr(model)
     control_period = 1.0 / control_hz
 
-    times: list[float] = []
-    actions: list[np.ndarray] = []
-    states: list[np.ndarray] = []
-    qpos_log: list[np.ndarray] = []
-    qvel_log: list[np.ndarray] = []
+    recorder = EpisodeRecorder()
     collisions: list[tuple[float, str, str]] = []
 
     last_sample_t = -math.inf
@@ -113,11 +113,13 @@ def run_episode(episode: Episode, control_hz: float) -> dict[str, np.ndarray]:
 
         if traj_t - last_sample_t >= control_period:
             last_sample_t = traj_t
-            times.append(traj_t)
-            actions.append(_action_vector(frame))
-            states.append(data.qpos[joint_adr].copy())
-            qpos_log.append(data.qpos.copy())
-            qvel_log.append(data.qvel.copy())
+            recorder.log(
+                time=traj_t,
+                action=_action_vector(frame),
+                state=data.qpos[joint_adr].copy(),
+                qpos=data.qpos.copy(),
+                qvel=data.qvel.copy(),
+            )
             for n1, n2 in scan_contacts(model, data, episode.robot_geom_ids, episode.env_geom_ids):
                 if is_unexpected(n1, n2):
                     collisions.append((traj_t, n1, n2))
@@ -151,28 +153,26 @@ def run_episode(episode: Episode, control_hz: float) -> dict[str, np.ndarray]:
         and len(collisions) == 0
     )
 
-    return {
-        "time": np.asarray(times),
-        "action": np.asarray(actions),
-        "state": np.asarray(states),
-        "qpos": np.asarray(qpos_log),
-        "qvel": np.asarray(qvel_log),
-        "cube_start": _pose4(episode.source),
-        "cube_target": _pose4(episode.target),
-        "cube_end": cube_end,
-        "robot_start": _robot6(episode.start_joints, episode.start_gripper),
-        "robot_end": _robot6(episode.end_joints, episode.end_gripper),
-        "grasp_face": np.array(episode.grasp.face),
-        "grasp_elbow": np.array(episode.grasp.elbow),
-        "carry_mode": np.array(episode.trajectory.carry.mode),
-        "success": np.array(success),
-        "final_xy_error": np.array(xy_err),
-        "final_yaw_error": np.array(yaw_err),
-        "duration": np.array(trajectory.duration),
-        "control_hz": np.array(control_hz),
-        "attempts": np.array(episode.attempts),
-        "n_collisions": np.array(len(collisions)),
-    }
+    return recorder.save(
+        out_path,
+        episode_index=np.array(episode_index),
+        seed=np.array(seed),
+        cube_start=_pose4(episode.source),
+        cube_target=_pose4(episode.target),
+        cube_end=cube_end,
+        robot_start=_robot6(episode.start_joints, episode.start_gripper),
+        robot_end=_robot6(episode.end_joints, episode.end_gripper),
+        grasp_face=np.array(episode.grasp.face),
+        grasp_elbow=np.array(episode.grasp.elbow),
+        carry_mode=np.array(episode.trajectory.carry.mode),
+        success=np.array(success),
+        final_xy_error=np.array(xy_err),
+        final_yaw_error=np.array(yaw_err),
+        duration=np.array(trajectory.duration),
+        control_hz=np.array(control_hz),
+        attempts=np.array(episode.attempts),
+        n_collisions=np.array(len(collisions)),
+    )
 
 
 def main() -> None:
@@ -211,9 +211,8 @@ def main() -> None:
         except EpisodeSamplingError as exc:
             print(f"episode {index}: skipped ({exc})")
             continue
-        record = run_episode(episode, args.control_hz)
         path = args.out_dir / f"episode_{index:05d}.npz"
-        np.savez_compressed(path, episode_index=np.array(index), seed=np.array(args.seed), **record)
+        record = run_episode(episode, args.control_hz, path, episode_index=index, seed=args.seed)
         written += 1
         ok = bool(record["success"])
         successes += ok
