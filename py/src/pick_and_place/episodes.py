@@ -533,6 +533,7 @@ def prepare_episode(
     preflight_debug_limit: int = 12,
     failed_trajectory_dir: Path | None = None,
     failed_trajectory_limit: int = 8,
+    free_grasp: bool = False,
 ) -> Episode:
     """Sample poses and return the first collision-free pick-and-carry.
 
@@ -546,6 +547,9 @@ def prepare_episode(
     feasible trajectory, raises immediately. Otherwise keeps resampling until
     success or, if ``max_attempts`` is set, that many attempts fail — then raises
     :class:`EpisodeSamplingError`.
+
+    Set ``free_grasp`` for cleanup recovery: the source may be tilted and may
+    lie outside the vertical-face pickup annulus.
     """
     fixed_source = source is not None
     fixed_target = target is not None
@@ -555,8 +559,10 @@ def prepare_episode(
     if failed_trajectory_dir is not None:
         failed_trajectory_dir.mkdir(parents=True, exist_ok=True)
 
-    if fixed_source and not is_cube_placement_allowed(source.x, source.y):
-        reason = f"source ({source.x:.4f}, {source.y:.4f}) is outside the allowed pickup zone"
+    source_allowed = is_cube_drop_allowed if free_grasp else is_cube_placement_allowed
+    if fixed_source and not source_allowed(source.x, source.y):
+        zone = "drop zone" if free_grasp else "allowed pickup zone"
+        reason = f"source ({source.x:.4f}, {source.y:.4f}) is outside the {zone}"
         _write_failed_trajectory_note(failed_trajectory_dir, reason, source=source, target=target)
         raise EpisodeSamplingError(reason)
     if fixed_target and not is_cube_drop_allowed(target.x, target.y):
@@ -629,6 +635,7 @@ def prepare_episode(
             end_joints,
             end_gripper,
             drop_orientation=drop_orientation,
+            free_grasp=free_grasp,
         ):
             grasp = traj.grasp
             collect_preflight_detail = preflight_debug or failed_trajectory_dir is not None

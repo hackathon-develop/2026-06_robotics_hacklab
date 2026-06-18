@@ -6,6 +6,9 @@ import numpy as np
 
 from pick_and_place import build_environment, build_scene, export_scene
 from pick_and_place.environment import WORKSPACE_FRAME_APRILTAG_PLATES
+from pick_and_place.episodes import _build_model
+from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
+from pick_and_place.paper_detection import PAPER_TARGET_MARKER_NAME
 from pick_and_place.workspace_overlays import WORKSPACE_OVERLAY_GROUP, WORKSPACE_OVERLAYS
 
 
@@ -98,3 +101,13 @@ def test_export_scene_writes_compilable_xml(tmp_path):
     model = mujoco.MjModel.from_xml_path(str(output))
     assert model.body("pick_cube").id >= 0
     assert model.geom("workspace_global").id >= 0
+
+
+def test_episode_model_can_include_drop_zone_marker():
+    model, _ = _build_model(
+        CubePose(x=0.2, y=-0.1, z=CUBE_HALF_SIZE),
+        paper_target_marker=True,
+    )
+
+    assert model.body(PAPER_TARGET_MARKER_NAME).id >= 0
+    assert model.geom(PAPER_TARGET_MARKER_NAME + "_geom").id >= 0

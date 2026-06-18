@@ -38,6 +38,7 @@ from pick_and_place.episodes import (
     EpisodeSamplingError,
     _build_model,
     prepare_episode,
+    sample_cube,
     sample_near_neutral,
 )
 from pick_and_place.executor import (
@@ -76,6 +77,10 @@ CUBE_LOOK_TIMEOUT = 2.0
 # Plan-search budget per episode: how many source/target/end resamples to try
 # before declaring the cube unreachable from the current pose and aborting.
 EPISODE_MAX_ATTEMPTS = 40
+# Cube-recovery relocation retries. The move is unrecorded but required so
+# unattended collection can continue from a cube location that is usable for the
+# next recorded pickup.
+CUBE_RECOVERY_MAX_ATTEMPTS = 3
 
 
 class MockViewer:
@@ -107,12 +112,15 @@ def track_cube(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     timeout: float,
+    *,
+    free_grasp: bool = False,
+    return_out_of_zone: bool = False,
 ) -> CubePose | None:
     """Look for the cube on ``cap`` for up to ``timeout`` seconds.
 
-    Returns the cube pose if it is detected inside the allowed clearance annulus,
-    or ``None`` if nothing usable is seen before the timeout (not visible, or
-    outside the workspace)."""
+    Returns the cube pose if it is detected inside the allowed workspace, or
+    when ``return_out_of_zone`` is set. Otherwise returns ``None`` if nothing
+    usable is seen before the timeout (not visible, or outside the workspace)."""
     import cv2
     from scipy.spatial.transform import Rotation
 
@@ -123,7 +131,7 @@ def track_cube(
         estimate_cube_pose,
         make_cube_detector,
     )
-    from pick_and_place.workspace_overlays import is_cube_pickup_allowed
+    from pick_and_place.workspace_overlays import is_cube_drop_allowed, is_cube_pickup_allowed
 
     camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
     cam_pos = data.cam_xpos[camera_id].copy()
@@ -160,21 +168,24 @@ def track_cube(
             continue
 
         rotation, position = cube_pose_to_world(estimate, cam_pos, cam_rot)
-        if not is_cube_pickup_allowed(float(position[0]), float(position[1])):
+        allowed = is_cube_drop_allowed if free_grasp else is_cube_pickup_allowed
+        if not allowed(float(position[0]), float(position[1])):
+            zone = "drop zone" if free_grasp else "allowed pick-up zones"
             print(
                 f"Cube seen at ({position[0]:.3f}, {position[1]:.3f}) but outside the "
-                "allowed pick-up zones."
+                f"{zone}."
             )
-            continue
+            if not return_out_of_zone:
+                continue
 
-        _, _, yaw = Rotation.from_matrix(rotation).as_euler("xyz")
+        roll, pitch, yaw = Rotation.from_matrix(rotation).as_euler("xyz")
         print(f"Tracked cube: pos=({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})")
         return CubePose(
             x=float(position[0]),
             y=float(position[1]),
             z=CUBE_HALF_SIZE,
-            roll=0.0,
-            pitch=0.0,
+            roll=float(roll) if free_grasp else 0.0,
+            pitch=float(pitch) if free_grasp else 0.0,
             yaw=float(yaw),
         )
 
@@ -488,10 +499,17 @@ def main() -> None:
         move_to(REST_ARM_JOINTS, REST_GRIPPER, park)
         ended_at_rest = True
 
-    def hunt_for_cube(viewer) -> CubePose | None:
+    from pick_and_place.workspace_overlays import is_cube_pickup_allowed
+
+    def hunt_for_cube(
+        viewer,
+        *,
+        free_grasp: bool = False,
+        return_out_of_zone: bool = False,
+    ) -> CubePose | None:
         """Look for the cube from the current pose, re-homing near neutral up to
         ``--max-hunt-tries`` times. Returns the cube pose or ``None`` if not found."""
-        if args.source is not None:
+        if args.source is not None and not free_grasp:
             return CubePose(x=args.source[0], y=args.source[1], z=CUBE_HALF_SIZE)
         for attempt in range(args.max_hunt_tries):
             if not viewer.is_running():
@@ -503,10 +521,84 @@ def main() -> None:
                 time.sleep(0.5)  # let the camera settle
             else:
                 print(f"Look {attempt + 1}/{args.max_hunt_tries}: searching from current pose...")
-            source = track_cube(overhead_cap, args.camera_name, model, data, CUBE_LOOK_TIMEOUT)
+            source = track_cube(
+                overhead_cap,
+                args.camera_name,
+                model,
+                data,
+                CUBE_LOOK_TIMEOUT,
+                free_grasp=free_grasp,
+                return_out_of_zone=return_out_of_zone,
+            )
             if source is not None:
                 return source
         return None
+
+    def recover_cube(viewer) -> bool:
+        """Move the cube to a fresh random source pose before the next episode."""
+        for recovery_attempt in range(1, CUBE_RECOVERY_MAX_ATTEMPTS + 1):
+            print(
+                f"\n--- Cube recovery {recovery_attempt}/{CUBE_RECOVERY_MAX_ATTEMPTS} "
+                "(not recorded) ---"
+            )
+            recovery_source = hunt_for_cube(viewer, free_grasp=True)
+            if not viewer.is_running():
+                return False
+            if recovery_source is None:
+                print("Cube recovery could not locate the cube.")
+                continue
+
+            current_joints, current_gripper = read_current_sim_pose()
+            with recover_on(
+                EpisodeSamplingError,
+                EpisodeAborted,
+                recover=lambda: abort_to_near_neutral(viewer),
+            ):
+                try:
+                    recovery = prepare_episode(
+                        rng,
+                        recovery_source,
+                        sample_cube(rng),
+                        start_joints=current_joints,
+                        start_gripper=current_gripper,
+                        model=model,
+                        data=data,
+                        max_attempts=EPISODE_MAX_ATTEMPTS,
+                        verbose=True,
+                        include_environment=args.environment,
+                        drop_orientation=args.drop_orientation,
+                        preflight_debug=args.preflight_debug,
+                        preflight_debug_limit=args.preflight_debug_limit,
+                        failed_trajectory_dir=args.save_failed_trajectories,
+                        failed_trajectory_limit=args.failed_trajectory_limit,
+                        free_grasp=True,
+                    )
+                except EpisodeSamplingError:
+                    print("Cube recovery: no feasible relocation plan.")
+                    raise
+
+                print(
+                    f"Recovering cube to pickup zone "
+                    f"({recovery.target.x:.3f}, {recovery.target.y:.3f})."
+                )
+                status = execute_episode(
+                    recovery,
+                    follower=follower,
+                    viewer=viewer,
+                    offsets_path=args.offsets_path,
+                    speed=args.speed,
+                    wrist_camera=args.wrist_camera,
+                    wrist_intrinsics=args.wrist_intrinsics,
+                    show_wrist_cam=args.show_wrist_cam,
+                    show_wrist_mixed=args.show_wrist_mixed,
+                    failed_trajectory_dir=args.save_failed_trajectories,
+                    free_grasp=True,
+                )
+                if status == "restart":
+                    raise EpisodeAborted
+                return True
+
+        return False
 
     disable_viewer = args.no_viewer or (
         (args.show_wrist_cam or args.show_wrist_mixed) and sys.platform == "darwin"
@@ -547,12 +639,26 @@ def main() -> None:
                                 break
                             episode_target = tracked_target
 
-                    source = hunt_for_cube(viewer)
+                    source = hunt_for_cube(viewer, return_out_of_zone=True)
                     if not viewer.is_running():
                         break
                     if source is None:
                         print(f"Cube not found after {args.max_hunt_tries} looks. Ending loop.")
                         break
+                    if not is_cube_pickup_allowed(source.x, source.y):
+                        print("Cube needs recovery before the next recorded pickup.")
+                        if not recover_cube(viewer):
+                            print("Cube recovery failed after retries. Ending loop.")
+                            break
+                        source = hunt_for_cube(viewer)
+                        if not viewer.is_running():
+                            break
+                        if source is None:
+                            print(
+                                f"Cube not found after recovery and "
+                                f"{args.max_hunt_tries} looks. Ending loop."
+                            )
+                            break
 
                     current_joints, current_gripper = read_current_sim_pose()
                     # Per-episode guard: an infeasible plan or a failed checkpoint
@@ -609,6 +715,11 @@ def main() -> None:
                             raise EpisodeAborted
 
                         ep.complete()
+                        is_last = args.episodes != 0 and ep.index >= args.episodes
+                        if not is_last:
+                            if not recover_cube(viewer):
+                                print("Cube recovery failed after retries. Ending loop.")
+                                break
 
                 # Normal end (episode budget met, cube lost, or viewer closed): the
                 # arm is at the last near-neutral pose — flow it straight to REST.

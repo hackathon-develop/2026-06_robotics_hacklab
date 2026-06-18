@@ -44,7 +44,7 @@ from pick_and_place.follower import (
     real_frame_to_sim,
     sim_frame_to_real,
 )
-from pick_and_place.trajectory import replan_remaining_phases
+from pick_and_place.trajectory import replan_remaining_candidates
 from pick_and_place.kinematics import So101Kinematics
 from pick_and_place.recorder import EpisodeRecorder
 
@@ -237,6 +237,7 @@ def execute_episode(
     show_wrist_cam: bool = False,
     show_wrist_mixed: bool = False,
     failed_trajectory_dir: Path | str | None = None,
+    free_grasp: bool = False,
 ) -> str:
     """Run one pass of a prepared episode on an already-connected follower.
 
@@ -438,7 +439,7 @@ def execute_episode(
             playback_start = data.time
             
             # Setup PBVS dynamically updating current source
-            from pick_and_place.trajectory import DescentPhase, _shortest_delta
+            from pick_and_place.trajectory import DescentPhase, _shortest_delta, grasp_candidates
             from pick_and_place.geometry import CubePose, CUBE_HALF_SIZE
             from scipy.spatial.transform import Rotation
             import dataclasses
@@ -535,7 +536,17 @@ def execute_episode(
                             smoothed_source = dataclasses.replace(
                                 new_source, x=smoothed_x, y=smoothed_y, yaw=smoothed_yaw
                             )
-                            phase = dataclasses.replace(phase, source=smoothed_source)
+                            if phase.grasp.face != "free":
+                                updated_grasp = next(
+                                    (
+                                        g
+                                        for g in grasp_candidates(kinematics, smoothed_source)
+                                        if g.face == phase.grasp.face and g.elbow == phase.grasp.elbow
+                                    ),
+                                    None,
+                                )
+                                if updated_grasp is not None:
+                                    phase = dataclasses.replace(phase, grasp=updated_grasp)
                             dynamic_source = smoothed_source
                             
                             # Update simulated cube to match camera detection
@@ -635,13 +646,25 @@ def execute_episode(
                     print(f"  y={tcp_cube[1]*1000:+.1f} mm")
                     print(f"  z={tcp_cube[2]*1000:+.1f} mm")
                     print("-------------------------\n")
+
+                # Treat grasp + lift as one contact-critical section. Right
+                # after closing, measured readback often maps the jaws/cube
+                # slightly through the sim floor, so a checkpoint here adds a
+                # pause without giving useful state. Lift immediately from the
+                # locked grasp pose, then measure/replan once safely clear.
+                if len(current_traj.phases) > 1 and current_traj.phases[1].name == "lift":
+                    current_traj = dataclasses.replace(current_traj, phases=current_traj.phases[1:])
+                    continue
             
             if completed_phase_name == "descent" and isinstance(phase, DescentPhase):
-                from pick_and_place.trajectory import grasp_candidates
-                for g in grasp_candidates(kinematics, dynamic_source):
-                    if g.face == phase.face and g.elbow == phase.elbow:
-                        dynamic_grasp = g
-                        break
+                if free_grasp:
+                    dynamic_grasp = phase.grasp
+                else:
+                    from pick_and_place.trajectory import grasp_candidates
+                    for g in grasp_candidates(kinematics, dynamic_source):
+                        if g.face == phase.face and g.elbow == phase.elbow:
+                            dynamic_grasp = g
+                            break
             
             # Checkpoint Replanning
             if len(current_traj.phases) <= 1:
@@ -660,64 +683,87 @@ def execute_episode(
                 print(f"Measured sim jaw clearance before replan: {clearance * 1000:+.1f} mm")
             
             print(f"Replanning remaining trajectory after {completed_phase_name}...")
-            candidate_traj = replan_remaining_phases(
-                kinematics,
-                measured_joints,
-                measured_gripper,
-                completed_phase_name,
-                dynamic_source,
-                episode.target,
-                dynamic_grasp,
-                episode.end_joints,
-                episode.end_gripper,
-                drop_orientation=episode.trajectory.drop_orientation,
-            )
-            
+            candidate_traj = None
+            rejected_traj = None
+            rejected_detail = None
+            rejected_unexpected: list[tuple[float, str, str]] = []
+            for replan_index, replan_traj in enumerate(
+                replan_remaining_candidates(
+                    kinematics,
+                    measured_joints,
+                    measured_gripper,
+                    completed_phase_name,
+                    dynamic_source,
+                    episode.target,
+                    dynamic_grasp,
+                    episode.end_joints,
+                    episode.end_gripper,
+                    drop_orientation=episode.trajectory.drop_orientation,
+                    free_grasp=free_grasp,
+                ),
+                start=1,
+            ):
+                if failed_trajectory_path is not None:
+                    detail_events = _preflight(
+                        model,
+                        replan_traj,
+                        actuator_id,
+                        robot_geom_ids,
+                        env_geom_ids,
+                        detailed=True,
+                    )
+                    unexpected_detail = [
+                        event for event in detail_events if _preflight_collision_is_unexpected(event)
+                    ]
+                    unexpected = [
+                        (event.time, event.geom1, event.geom2) for event in unexpected_detail
+                    ]
+                else:
+                    events = _preflight(model, replan_traj, actuator_id, robot_geom_ids, env_geom_ids)
+                    unexpected_detail = None
+                    unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
+                if not unexpected:
+                    candidate_traj = replan_traj
+                    if replan_index > 1:
+                        print(f"Selected replan candidate {replan_index} after preflight rejections.")
+                    break
+                rejected_traj = replan_traj
+                rejected_detail = unexpected_detail
+                rejected_unexpected = unexpected
+                if replan_traj.carry is not None:
+                    print(
+                        f"  rejected replan candidate {replan_index}: "
+                        f"carry={replan_traj.carry.mode} collision t={unexpected[0][0]:.3f}s "
+                        f"{unexpected[0][1]} ↔ {unexpected[0][2]}"
+                    )
+
             if candidate_traj is None:
-                print("Error: No feasible plan from current state. Aborting episode.")
+                if rejected_traj is None:
+                    print("Error: No feasible plan from current state. Aborting episode.")
+                    reason = f"no feasible replan after {completed_phase_name}"
+                else:
+                    print("Error: All replan candidates failed preflight. Aborting episode.")
+                    for t, n1, n2 in rejected_unexpected:
+                        print(f"  collision t={t:.3f}s {n1} ↔ {n2}")
+                    reason = f"all replan candidates failed preflight after {completed_phase_name}"
+                    if failed_trajectory_path is not None and rejected_detail is not None:
+                        path = failed_trajectory_path / (
+                            f"replan_after_{completed_phase_name or 'start'}_failed.npz"
+                        )
+                        _save_failed_preflight_trajectory(
+                            path,
+                            model,
+                            rejected_traj,
+                            actuator_id,
+                            rejected_detail,
+                        )
+                        print(f"saved rejected replan trajectory: {path}")
                 _write_failed_trajectory_note(
                     failed_trajectory_path,
-                    f"no feasible replan after {completed_phase_name}",
+                    reason,
                     source=dynamic_source,
                     target=episode.target,
                 )
-                return "restart"
-
-            # Preflight the newly planned remaining trajectory.
-            if failed_trajectory_path is not None:
-                detail_events = _preflight(
-                    model,
-                    candidate_traj,
-                    actuator_id,
-                    robot_geom_ids,
-                    env_geom_ids,
-                    detailed=True,
-                )
-                unexpected_detail = [
-                    event for event in detail_events if _preflight_collision_is_unexpected(event)
-                ]
-                unexpected = [
-                    (event.time, event.geom1, event.geom2) for event in unexpected_detail
-                ]
-            else:
-                events = _preflight(model, candidate_traj, actuator_id, robot_geom_ids, env_geom_ids)
-                unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
-            if unexpected:
-                print("Error: Replanned segment failed preflight. Aborting episode.")
-                for t, n1, n2 in unexpected:
-                    print(f"  collision t={t:.3f}s {n1} ↔ {n2}")
-                if failed_trajectory_path is not None:
-                    path = failed_trajectory_path / (
-                        f"replan_after_{completed_phase_name or 'start'}_failed.npz"
-                    )
-                    _save_failed_preflight_trajectory(
-                        path,
-                        model,
-                        candidate_traj,
-                        actuator_id,
-                        unexpected_detail,
-                    )
-                    print(f"saved rejected replan trajectory: {path}")
                 return "restart"
 
             current_traj = candidate_traj
