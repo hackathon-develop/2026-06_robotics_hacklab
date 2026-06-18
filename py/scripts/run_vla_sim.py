@@ -59,31 +59,18 @@ from pick_and_place.follower import (
 )
 from pick_and_place.geometry import CUBE_HALF_SIZE
 from pick_and_place.trajectory import GRIPPER_OPEN, NEUTRAL_ARM_JOINTS
+from pick_and_place.vla import (
+    DEFAULT_CHECKPOINT,
+    DEFAULT_INSTRUCTION,
+    OVERHEAD_FEATURE,
+    WRIST_FEATURE,
+    make_policy,
+    select_device,
+)
 
 # Control/render rate. The sim steps at the model timestep; one policy query and
 # one camera render happen per control tick.
 CONTROL_HZ = 10.0
-DEFAULT_CHECKPOINT = "lerobot/smolvla_base"
-DEFAULT_INSTRUCTION = "Pick up the cube and place it on the target."
-
-# SmolVLA keys cameras by their name in input_features, so the training
-# `--rename_map` and eval must agree on which physical camera fills each slot.
-# Following SmolVLA's convention that the main/overview camera comes first, the
-# overhead view is camera1 and the wrist is camera2.
-OVERHEAD_FEATURE = "observation.images.camera1"
-WRIST_FEATURE = "observation.images.camera2"
-
-
-def _select_device(requested: str):
-    import torch
-
-    if requested != "auto":
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def _build_model(source_xy: tuple[float, float], source_yaw: float, render_size: int):
@@ -148,46 +135,6 @@ def _set_neutral(model: mujoco.MjModel, data: mujoco.MjData) -> None:
     mujoco.mj_forward(model, data)
 
 
-def _make_policy(checkpoint: str, image_hw: tuple[int, int], device):
-    """Load a SmolVLA checkpoint with feature specs for our 6-DOF arm and two
-    cameras, plus its pre/post-processors.
-
-    SmolVLA pads state/action to a fixed internal width, so the base weights load
-    against any robot whose dims fit — no finetuning needed to run a forward pass.
-    The normalization stats come from the checkpoint's own saved processor (the
-    base ships its pretraining stats; a fine-tune saves the project dataset's),
-    which is why the dataset stays in raw physical units.
-    """
-    from lerobot.configs.types import FeatureType, PolicyFeature
-    from lerobot.policies.factory import make_pre_post_processors
-    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-
-    h, w = image_hw
-    n_joints = len(JOINT_NAMES)
-    config = SmolVLAConfig(
-        input_features={
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(n_joints,)),
-            WRIST_FEATURE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, h, w)),
-            OVERHEAD_FEATURE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, h, w)),
-        },
-        output_features={
-            "action": PolicyFeature(type=FeatureType.ACTION, shape=(n_joints,)),
-        },
-        device=str(device),
-    )
-    policy = SmolVLAPolicy.from_pretrained(checkpoint, config=config)
-    policy.to(device)
-    policy.eval()
-
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=config,
-        pretrained_path=checkpoint,
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
-    )
-    return policy, preprocessor, postprocessor
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION, help="language task string")
@@ -226,7 +173,7 @@ def main() -> None:
 
     from lerobot.utils.control_utils import predict_action
 
-    device = _select_device(args.device)
+    device = select_device(args.device)
     print(f"Loading {args.checkpoint} on {device} (first run downloads the weights)...")
 
     model, data = _build_model(tuple(args.source), args.source_yaw, args.image_size)
@@ -239,7 +186,7 @@ def main() -> None:
     offsets = load_follower_joint_offsets(None)
 
     hw = (args.image_size, args.image_size)
-    policy, preprocessor, postprocessor = _make_policy(args.checkpoint, hw, device)
+    policy, preprocessor, postprocessor = make_policy(args.checkpoint, hw, hw, device)
     policy.reset()
 
     renderer = mujoco.Renderer(model, height=hw[0], width=hw[1])
