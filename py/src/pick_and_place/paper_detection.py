@@ -45,6 +45,13 @@ class PaperTracker:
         self._smoothed_size: NDArray | None = None
         self._last_target: PaperTarget | None = None
 
+    def reset(self) -> None:
+        """Forget prior detections so the next estimate must be observed anew."""
+        self._smoothed_center = None
+        self._smoothed_yaw = None
+        self._smoothed_size = None
+        self._last_target = None
+
     def update(self, target: PaperTarget | None) -> PaperTarget | None:
         """Update the estimate with a new detection. Returns the smoothed target."""
         if target is None:

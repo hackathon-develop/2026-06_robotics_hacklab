@@ -42,6 +42,7 @@ from pick_and_place.episodes import (
     sample_near_neutral,
 )
 from pick_and_place.executor import (
+    HARDWARE_SIMULATION_HZ,
     REAL_ARM_DEFAULT_SPEED,
     clamp_and_warn,
     execute_episode,
@@ -207,6 +208,10 @@ def track_drop_zone_square(
     from pick_and_place.camera_compare import load_intrinsics
     from pick_and_place.camera_intrinsics import LOCAL_CAMERA_INTRINSICS_DIR
     from pick_and_place.workspace_overlays import is_cube_drop_allowed
+
+    # This function is called once per episode. Do not let the tracker's cached
+    # estimate satisfy a new episode when the square is no longer visible.
+    tracker.reset()
 
     camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
     cam_pos = data.cam_xpos[camera_id].copy()
@@ -409,6 +414,7 @@ def main() -> None:
         include_environment=args.environment,
         paper_target_marker=args.target_drop_zone or args.show_drop_zone,
     )
+    model.opt.timestep = 1.0 / HARDWARE_SIMULATION_HZ
     apply_camera_extrinsics_to_model(model, load_local_camera_extrinsics())
     mujoco.mj_forward(model, data)
 
@@ -558,7 +564,6 @@ def main() -> None:
                     recovery = prepare_episode(
                         rng,
                         recovery_source,
-                        sample_cube(rng),
                         start_joints=current_joints,
                         start_gripper=current_gripper,
                         model=model,
@@ -572,6 +577,7 @@ def main() -> None:
                         failed_trajectory_dir=args.save_failed_trajectories,
                         failed_trajectory_limit=args.failed_trajectory_limit,
                         free_grasp=True,
+                        target_sampler=sample_cube,
                     )
                 except EpisodeSamplingError:
                     print("Cube recovery: no feasible relocation plan.")

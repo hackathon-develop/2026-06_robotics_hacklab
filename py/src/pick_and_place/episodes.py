@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -534,11 +535,13 @@ def prepare_episode(
     failed_trajectory_dir: Path | None = None,
     failed_trajectory_limit: int = 8,
     free_grasp: bool = False,
+    target_sampler: Callable[[np.random.Generator], CubePose] | None = None,
 ) -> Episode:
     """Sample poses and return the first collision-free pick-and-carry.
 
     ``source``/``target`` pin those cube poses (otherwise they are resampled
-    each attempt). The start arm pose is sampled fresh each attempt unless
+    each attempt). ``target_sampler`` can override target sampling when no
+    target is pinned. The start arm pose is sampled fresh each attempt unless
     ``start_joints``/``start_gripper`` pin it (e.g. to the real arm's current
     pose); the end pose is always sampled fresh. Pass ``model``/``data`` to reuse
     a single persistent scene (its ``pick_cube`` freejoint is moved to ``source``)
@@ -555,6 +558,9 @@ def prepare_episode(
     fixed_target = target is not None
     fixed_start = start_joints is not None
     reuse_model = model is not None
+
+    if fixed_target and target_sampler is not None:
+        raise ValueError("target and target_sampler are mutually exclusive")
 
     if failed_trajectory_dir is not None:
         failed_trajectory_dir.mkdir(parents=True, exist_ok=True)
@@ -576,7 +582,7 @@ def prepare_episode(
         attempt += 1
 
         ep_source = source if fixed_source else sample_cube(rng)
-        ep_target = target if fixed_target else sample_target(rng)
+        ep_target = target if fixed_target else (target_sampler or sample_target)(rng)
         if fixed_start:
             ep_start_joints, ep_start_gripper = dict(start_joints), float(start_gripper)
         else:

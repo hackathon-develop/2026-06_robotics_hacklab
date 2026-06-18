@@ -17,6 +17,90 @@ def box_names():
     return [box.name for boxes in COLLISION_BOXES.values() for box in boxes]
 
 
+def test_shoulder_uses_two_collision_boxes():
+    boxes = COLLISION_BOXES["shoulder"]
+
+    assert [box.name for box in boxes] == ["shoulder_col0", "shoulder_col1"]
+    np.testing.assert_allclose(
+        [box.size for box in boxes], [(0.025, 0.031, 0.028), (0.028, 0.019, 0.027)]
+    )
+    np.testing.assert_allclose(
+        [box.pos for box in boxes],
+        [
+            (-0.0181991995, 0.000162462614, 0.0188999997),
+            (-0.0321991995, 0.00116246261, -0.0381000003),
+        ],
+    )
+
+
+def test_upper_arm_uses_two_collision_boxes():
+    boxes = COLLISION_BOXES["upper_arm"]
+
+    assert [box.name for box in boxes] == ["upper_arm_col0", "upper_arm_col1"]
+    np.testing.assert_allclose(
+        [box.size for box in boxes], [(0.012, 0.034, 0.052), (0.026, 0.025, 0.019)]
+    )
+    np.testing.assert_allclose(
+        [box.pos for box in boxes],
+        [
+            (-0.039084999, 0.000899999723, 0.0201499995),
+            (-0.112084999, -0.0131000003, 0.0191499995),
+        ],
+    )
+
+
+def test_lower_arm_uses_two_collision_boxes():
+    boxes = COLLISION_BOXES["lower_arm"]
+
+    assert [box.name for box in boxes] == ["lower_arm_col0", "lower_arm_col1"]
+    np.testing.assert_allclose(
+        [box.size for box in boxes], [(0.012, 0.032, 0.050), (0.018, 0.028, 0.027)]
+    )
+    np.testing.assert_allclose(
+        [box.pos for box in boxes],
+        [
+            (-0.0385499965, -0.000550141265, 0.0201997877),
+            (-0.117549996, 0.00344985871, 0.0202001922),
+        ],
+    )
+
+
+def test_wrist_uses_three_collision_boxes():
+    boxes = COLLISION_BOXES["wrist"]
+
+    assert [box.name for box in boxes] == ["wrist_col0", "wrist_col1", "wrist_col2"]
+    np.testing.assert_allclose(
+        [box.size for box in boxes],
+        [(0.012, 0.032, 0.017), (0.016, 0.026, 0.007), (0.018, 0.032, 0.012)],
+    )
+    np.testing.assert_allclose(
+        [box.pos for box in boxes],
+        [
+            (-0.000795616758, -0.00584594182, 0.0221499983),
+            (-0.0000924933516, -0.0578411875, 0.028150002),
+            (-0.00237626471, -0.0368701509, 0.0221500008),
+        ],
+    )
+
+
+def test_fixed_jaw_refits_only_holder_boxes():
+    boxes = COLLISION_BOXES["gripper"]
+    holder_boxes = [box for box in boxes if box.name in {"fixed_jaw_col0a", "fixed_jaw_col0b"}]
+    tuned_boxes = [box for box in boxes if box.name.startswith("fixed_jaw_col")][2:]
+
+    assert [box.name for box in holder_boxes] == ["fixed_jaw_col0a", "fixed_jaw_col0b"]
+    np.testing.assert_allclose(
+        [box.size for box in holder_boxes], [(0.02325, 0.024, 0.012), (0.03225, 0.02625, 0.00825)]
+    )
+    assert [(box.name, box.pos, box.size) for box in tuned_boxes] == [
+        ("fixed_jaw_col1", (-0.0244, 0.0, -0.041025), (0.00941, 0.016, 0.00412)),
+        ("fixed_jaw_col2", (-0.02291, 0.0, -0.05485), (0.00962, 0.01134, 0.00981)),
+        ("fixed_jaw_col3", (-0.0176, 0.0, -0.0745), (0.00601, 0.00805, 0.0098)),
+        ("fixed_jaw_col4", (-0.01492, -0.00018, -0.0893), (0.00503, 0.00703, 0.005)),
+        ("fixed_jaw_col5", (-0.01189, -0.00015, -0.099363), (0.004, 0.00545, 0.005063)),
+    ]
+
+
 def test_robot_has_box_collisions_only():
     model = build_robot().compile()
     names = [model.geom(i).name for i in range(model.ngeom)]

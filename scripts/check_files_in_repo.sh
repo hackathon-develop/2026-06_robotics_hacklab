@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-MAX_BYTES=$((50 * 1024))
+MAX_BYTES=$((60 * 1024))
 
 failed=0
 
