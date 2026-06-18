@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import math
 import sys
 import time
 from pathlib import Path
@@ -119,7 +118,7 @@ def track_cube(
         estimate_cube_pose,
         make_cube_detector,
     )
-    from pick_and_place.workspace_overlays import PAN_AXIS, WORKSPACE_OVERLAYS
+    from pick_and_place.workspace_overlays import is_cube_pickup_allowed
 
     camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
     cam_pos = data.cam_xpos[camera_id].copy()
@@ -136,8 +135,6 @@ def track_cube(
         undistort_map = None
 
     detector = make_cube_detector()
-    clearance = next(o for o in WORKSPACE_OVERLAYS if o.name == "workspace_clearance_pregrasp")
-    r_inner, r_outer = clearance.inner_radius, clearance.outer_radius
 
     # Flush a few stale frames so we read what the arm sees now, not buffered.
     for _ in range(5):
@@ -158,11 +155,10 @@ def track_cube(
             continue
 
         rotation, position = cube_pose_to_world(estimate, cam_pos, cam_rot)
-        r = math.hypot(position[0] - PAN_AXIS[0], position[1] - PAN_AXIS[1])
-        if r < r_inner or r > r_outer:
+        if not is_cube_pickup_allowed(float(position[0]), float(position[1])):
             print(
                 f"Cube seen at ({position[0]:.3f}, {position[1]:.3f}) but outside the "
-                f"clearance annulus (r={r:.3f}m, allowed {r_inner:.3f}-{r_outer:.3f}m)."
+                "allowed pick-up zones."
             )
             continue
 

@@ -34,6 +34,9 @@ from pick_and_place.workspace_overlays import (
     AZIMUTH_MIN,
     PAN_AXIS,
     WORKSPACE_OVERLAYS,
+    CUBE_PLACEMENT_OVERLAY,
+    is_cube_drop_allowed,
+    is_cube_placement_allowed,
 )
 
 _CLEARANCE_OVERLAY = next(o for o in WORKSPACE_OVERLAYS if o.name == "workspace_clearance_pregrasp")
@@ -62,18 +65,36 @@ class EpisodeSamplingError(RuntimeError):
 
 
 def sample_cube(rng: np.random.Generator) -> CubePose:
-    """Sample a cube pose uniformly inside the clearance-pregrasp annular sector."""
+    """Sample a cube pose in the clearance sector and inside the frame rails."""
     r_inner, r_outer = _CLEARANCE_OVERLAY.inner_radius, _CLEARANCE_OVERLAY.outer_radius
-    # Uniform area sampling: draw r² uniformly so density is flat in 2-D.
-    r = math.sqrt(rng.uniform(r_inner**2, r_outer**2))
-    theta = rng.uniform(AZIMUTH_MIN, AZIMUTH_MAX)
+    while True:
+        # Uniform radial sampling to prevent points bunching up at the outer edge.
+        r = rng.uniform(r_inner, r_outer)
+        theta = rng.uniform(AZIMUTH_MIN, AZIMUTH_MAX)
+        x = PAN_AXIS[0] + r * math.cos(theta)
+        y = PAN_AXIS[1] + r * math.sin(theta)
+        if is_cube_placement_allowed(x, y):
+            break
     yaw = rng.uniform(0.0, 2 * math.pi)
     return CubePose(
-        x=PAN_AXIS[0] + r * math.cos(theta),
-        y=PAN_AXIS[1] + r * math.sin(theta),
+        x=x,
+        y=y,
         z=CUBE_HALF_SIZE,
         yaw=yaw,
     )
+
+
+def sample_target(rng: np.random.Generator) -> CubePose:
+    """Sample a target in the broader position-only drop sector."""
+    r_inner = CUBE_PLACEMENT_OVERLAY.inner_radius
+    r_outer = CUBE_PLACEMENT_OVERLAY.outer_radius
+    while True:
+        r = rng.uniform(r_inner, r_outer)
+        theta = rng.uniform(AZIMUTH_MIN, AZIMUTH_MAX)
+        x = PAN_AXIS[0] + r * math.cos(theta)
+        y = PAN_AXIS[1] + r * math.sin(theta)
+        if is_cube_drop_allowed(x, y):
+            return CubePose(x=x, y=y, z=CUBE_HALF_SIZE)
 
 
 def sample_near_neutral(rng: np.random.Generator) -> tuple[dict[str, float], float]:
@@ -306,7 +327,7 @@ def prepare_episode(
         attempt += 1
 
         ep_source = source if fixed_source else sample_cube(rng)
-        ep_target = target if fixed_target else sample_cube(rng)
+        ep_target = target if fixed_target else sample_target(rng)
         if fixed_start:
             ep_start_joints, ep_start_gripper = dict(start_joints), float(start_gripper)
         else:
