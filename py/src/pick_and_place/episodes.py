@@ -14,7 +14,10 @@ for a trajectory that runs clean — resampling the poses until one is found.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -22,6 +25,7 @@ import numpy as np
 from pick_and_place import build_scene
 from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
 from pick_and_place.kinematics import So101Kinematics, derive_kinematics
+from pick_and_place.paper_detection import add_paper_target_marker
 from pick_and_place.trajectory import (
     DropOrientation,
     GRIPPER_OPEN,
@@ -63,6 +67,21 @@ MIN_START_CLEARANCE = 0.10
 
 class EpisodeSamplingError(RuntimeError):
     """Raised when no collision-free trajectory is found within the attempt budget."""
+
+
+@dataclass(frozen=True)
+class PreflightCollision:
+    """One unexpected contact observed while simulating a candidate trajectory."""
+
+    time: float
+    phase: str
+    phase_time: float
+    geom1: str
+    geom2: str
+    body1: str
+    body2: str
+    dist: float
+    position: tuple[float, float, float]
 
 
 def sample_cube(rng: np.random.Generator) -> CubePose:
@@ -170,13 +189,27 @@ def scan_contacts(
     return hits
 
 
+def _trajectory_phase_at(trajectory: Trajectory, elapsed: float) -> tuple[str, float]:
+    t = elapsed
+    for phase in trajectory.phases:
+        if t < phase.duration:
+            return phase.name, t
+        t -= phase.duration
+    if not trajectory.phases:
+        return "none", elapsed
+    last = trajectory.phases[-1]
+    return last.name, min(max(t, 0.0), last.duration)
+
+
 def _preflight(
     model: mujoco.MjModel,
     trajectory: Trajectory,
     actuator_id: dict[str, int],
     robot_geom_ids: set[int],
     env_geom_ids: set[int],
-) -> list[tuple[float, str, str]]:
+    *,
+    detailed: bool = False,
+) -> list[tuple[float, str, str]] | list[PreflightCollision]:
     """Simulate the full trajectory in a shadow MjData and return collision events.
 
     The shadow starts at the trajectory's own start pose (``start_joints`` /
@@ -193,15 +226,47 @@ def _preflight(
 
     mujoco.mj_forward(model, shadow)
 
-    events: list[tuple[float, str, str]] = []
+    events: list[tuple[float, str, str]] | list[PreflightCollision] = []
     while shadow.time < trajectory.duration:
         frame = trajectory.evaluate(shadow.time)
         for name, value in frame.joints.items():
             shadow.ctrl[actuator_id[name]] = value
         shadow.ctrl[actuator_id["gripper"]] = frame.gripper
         mujoco.mj_step(model, shadow)
-        for n1, n2 in scan_contacts(model, shadow, robot_geom_ids, env_geom_ids):
-            events.append((shadow.time, n1, n2))
+        for i in range(shadow.ncon):
+            contact = shadow.contact[i]
+            g1, g2 = int(contact.geom[0]), int(contact.geom[1])
+            g1_robot = g1 in robot_geom_ids
+            g2_robot = g2 in robot_geom_ids
+            if not (
+                (g1_robot and g2 in env_geom_ids)
+                or (g2_robot and g1 in env_geom_ids)
+                or (g1_robot and g2_robot)
+            ):
+                continue
+            n1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g1) or str(g1)
+            n2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g2) or str(g2)
+            if not detailed:
+                events.append((shadow.time, n1, n2))
+                continue
+            phase, phase_time = _trajectory_phase_at(trajectory, shadow.time)
+            b1_id = int(model.geom_bodyid[g1])
+            b2_id = int(model.geom_bodyid[g2])
+            b1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b1_id) or str(b1_id)
+            b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b2_id) or str(b2_id)
+            events.append(
+                PreflightCollision(
+                    time=float(shadow.time),
+                    phase=phase,
+                    phase_time=float(phase_time),
+                    geom1=n1,
+                    geom2=n2,
+                    body1=b1,
+                    body2=b2,
+                    dist=float(contact.dist),
+                    position=tuple(float(x) for x in contact.pos),
+                )
+            )
     return events
 
 
@@ -215,6 +280,162 @@ def _is_jaw(n: str) -> bool:
 def is_unexpected(n1: str, n2: str) -> bool:
     """False only for jaw↔cube contacts, which are the intentional grasp."""
     return not ((_is_jaw(n1) and n2 == "pick_cube") or (_is_jaw(n2) and n1 == "pick_cube"))
+
+
+def _preflight_collision_is_unexpected(event: PreflightCollision) -> bool:
+    return is_unexpected(event.geom1, event.geom2)
+
+
+def _print_preflight_debug(
+    attempt: int,
+    traj: Trajectory,
+    events: list[PreflightCollision],
+    *,
+    limit: int,
+) -> None:
+    grasp = traj.grasp
+    if grasp is None:
+        label = "unknown grasp"
+    else:
+        label = f"{grasp.face}/{grasp.elbow}"
+    print(f"preflight {attempt=} {label}: {len(events)} unexpected contacts")
+
+    phase_counts = Counter(event.phase for event in events)
+    pair_counts = Counter((min(event.geom1, event.geom2), max(event.geom1, event.geom2)) for event in events)
+    if phase_counts:
+        phase_summary = ", ".join(f"{phase}={count}" for phase, count in phase_counts.most_common())
+        print(f"  by phase: {phase_summary}")
+    for (g1, g2), count in pair_counts.most_common(6):
+        print(f"  pair {count:4d}x: {g1} <-> {g2}")
+
+    for event in events[:limit]:
+        penetration_mm = max(0.0, -event.dist) * 1000.0
+        print(
+            f"  t={event.time:.3f}s phase={event.phase}:{event.phase_time:.3f}s "
+            f"penetration={penetration_mm:.2f}mm "
+            f"{event.geom1}({event.body1}) <-> {event.geom2}({event.body2}) "
+            f"pos=({event.position[0]:.3f}, {event.position[1]:.3f}, {event.position[2]:.3f})"
+        )
+    if len(events) > limit:
+        print(f"  ... {len(events) - limit} more contacts omitted")
+
+
+def _cube_start_array(source: CubePose) -> np.ndarray:
+    return np.array((source.x, source.y, source.z, source.yaw), dtype=float)
+
+
+def _trajectory_pose_array(pose: CubePose) -> np.ndarray:
+    return np.array((pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw), dtype=float)
+
+
+def _save_failed_preflight_trajectory(
+    path: Path,
+    model: mujoco.MjModel,
+    trajectory: Trajectory,
+    actuator_id: dict[str, int],
+    events: list[PreflightCollision],
+) -> None:
+    """Save a rejected candidate as a replayable qpos rollout plus metadata."""
+    shadow = mujoco.MjData(model)
+    for name, value in trajectory.start_joints.items():
+        set_joint(model, shadow, name, value)
+        shadow.ctrl[actuator_id[name]] = value
+    set_joint(model, shadow, "gripper", trajectory.start_gripper)
+    shadow.ctrl[actuator_id["gripper"]] = trajectory.start_gripper
+    mujoco.mj_forward(model, shadow)
+
+    qpos: list[np.ndarray] = []
+    qvel: list[np.ndarray] = []
+    ctrl: list[np.ndarray] = []
+    t_values: list[float] = []
+    phase_names: list[str] = []
+    phase_times: list[float] = []
+
+    while shadow.time < trajectory.duration:
+        frame = trajectory.evaluate(shadow.time)
+        for name, value in frame.joints.items():
+            shadow.ctrl[actuator_id[name]] = value
+        shadow.ctrl[actuator_id["gripper"]] = frame.gripper
+        mujoco.mj_step(model, shadow)
+        phase, phase_time = _trajectory_phase_at(trajectory, shadow.time)
+        qpos.append(shadow.qpos.copy())
+        qvel.append(shadow.qvel.copy())
+        ctrl.append(shadow.ctrl.copy())
+        t_values.append(float(shadow.time))
+        phase_names.append(phase)
+        phase_times.append(float(phase_time))
+
+    grasp = trajectory.grasp
+    carry = trajectory.carry
+    event_rows = np.array(
+        [
+            (
+                event.time,
+                event.phase,
+                event.phase_time,
+                event.geom1,
+                event.geom2,
+                event.body1,
+                event.body2,
+                event.dist,
+                *event.position,
+            )
+            for event in events
+        ],
+        dtype=[
+            ("time", "f8"),
+            ("phase", "U32"),
+            ("phase_time", "f8"),
+            ("geom1", "U96"),
+            ("geom2", "U96"),
+            ("body1", "U96"),
+            ("body2", "U96"),
+            ("dist", "f8"),
+            ("x", "f8"),
+            ("y", "f8"),
+            ("z", "f8"),
+        ],
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        qpos=np.asarray(qpos),
+        qvel=np.asarray(qvel),
+        ctrl=np.asarray(ctrl),
+        t=np.asarray(t_values),
+        phase=np.asarray(phase_names),
+        phase_t=np.asarray(phase_times),
+        control_hz=np.array(1.0 / model.opt.timestep),
+        cube_start=_cube_start_array(trajectory.source),
+        source=_trajectory_pose_array(trajectory.source),
+        target=_trajectory_pose_array(trajectory.target),
+        grasp_face=np.array("" if grasp is None else grasp.face),
+        grasp_elbow=np.array("" if grasp is None else grasp.elbow),
+        carry_mode=np.array("" if carry is None else carry.mode),
+        drop_orientation=np.array(trajectory.drop_orientation),
+        duration=np.array(trajectory.duration),
+        collision_events=event_rows,
+    )
+
+
+def _write_failed_trajectory_note(
+    failed_trajectory_dir: Path | None,
+    reason: str,
+    *,
+    source: CubePose | None,
+    target: CubePose | None,
+) -> None:
+    if failed_trajectory_dir is None:
+        return
+    failed_trajectory_dir.mkdir(parents=True, exist_ok=True)
+    note = {
+        "reason": reason,
+        "source": None if source is None else _trajectory_pose_array(source).tolist(),
+        "target": None if target is None else _trajectory_pose_array(target).tolist(),
+    }
+    (failed_trajectory_dir / "planning_failed.json").write_text(
+        json.dumps(note, indent=2) + "\n"
+    )
 
 
 def jaw_geom_ids(model: mujoco.MjModel) -> list[int]:
@@ -277,8 +498,11 @@ def _build_model(
     include_environment: bool = False,
     offwidth: int = 1280,
     offheight: int = 720,
+    paper_target_marker: bool = False,
 ) -> tuple[mujoco.MjModel, mujoco.MjData]:
     spec = build_scene(include_environment=include_environment)
+    if paper_target_marker:
+        add_paper_target_marker(spec)
     spec.visual.global_.offwidth = max(spec.visual.global_.offwidth, offwidth)
     spec.visual.global_.offheight = max(spec.visual.global_.offheight, offheight)
     cube = spec.body("pick_cube")
@@ -305,6 +529,10 @@ def prepare_episode(
     offwidth: int = 1280,
     offheight: int = 720,
     drop_orientation: DropOrientation = "free",
+    preflight_debug: bool = False,
+    preflight_debug_limit: int = 12,
+    failed_trajectory_dir: Path | None = None,
+    failed_trajectory_limit: int = 8,
 ) -> Episode:
     """Sample poses and return the first collision-free pick-and-carry.
 
@@ -324,7 +552,20 @@ def prepare_episode(
     fixed_start = start_joints is not None
     reuse_model = model is not None
 
+    if failed_trajectory_dir is not None:
+        failed_trajectory_dir.mkdir(parents=True, exist_ok=True)
+
+    if fixed_source and not is_cube_placement_allowed(source.x, source.y):
+        reason = f"source ({source.x:.4f}, {source.y:.4f}) is outside the allowed pickup zone"
+        _write_failed_trajectory_note(failed_trajectory_dir, reason, source=source, target=target)
+        raise EpisodeSamplingError(reason)
+    if fixed_target and not is_cube_drop_allowed(target.x, target.y):
+        reason = f"target ({target.x:.4f}, {target.y:.4f}) is outside the allowed drop zone"
+        _write_failed_trajectory_note(failed_trajectory_dir, reason, source=source, target=target)
+        raise EpisodeSamplingError(reason)
+
     attempt = 0
+    saved_failed_trajectories = 0
     while max_attempts is None or attempt < max_attempts:
         attempt += 1
 
@@ -390,8 +631,23 @@ def prepare_episode(
             drop_orientation=drop_orientation,
         ):
             grasp = traj.grasp
-            events = _preflight(ep_model, traj, actuator_id, robot_geom_ids, env_geom_ids)
-            unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
+            collect_preflight_detail = preflight_debug or failed_trajectory_dir is not None
+            if collect_preflight_detail:
+                detail_events = _preflight(
+                    ep_model,
+                    traj,
+                    actuator_id,
+                    robot_geom_ids,
+                    env_geom_ids,
+                    detailed=True,
+                )
+                unexpected_detail = [
+                    event for event in detail_events if _preflight_collision_is_unexpected(event)
+                ]
+                unexpected = [(event.time, event.geom1, event.geom2) for event in unexpected_detail]
+            else:
+                events = _preflight(ep_model, traj, actuator_id, robot_geom_ids, env_geom_ids)
+                unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
             if not unexpected:
                 trajectory = traj
                 if verbose:
@@ -406,6 +662,36 @@ def prepare_episode(
                         f"  carry={traj.carry.mode}  (attempt {attempt})"
                     )
                 break
+            if preflight_debug:
+                _print_preflight_debug(
+                    attempt,
+                    traj,
+                    unexpected_detail,
+                    limit=preflight_debug_limit,
+                )
+            if (
+                failed_trajectory_dir is not None
+                and saved_failed_trajectories < failed_trajectory_limit
+            ):
+                grasp_label = (
+                    "unknown"
+                    if traj.grasp is None
+                    else f"{traj.grasp.face}_{traj.grasp.elbow}"
+                )
+                path = (
+                    failed_trajectory_dir
+                    / f"attempt_{attempt:03d}_candidate_{saved_failed_trajectories + 1:03d}_{grasp_label}.npz"
+                )
+                _save_failed_preflight_trajectory(
+                    path,
+                    ep_model,
+                    traj,
+                    actuator_id,
+                    unexpected_detail,
+                )
+                saved_failed_trajectories += 1
+                if verbose:
+                    print(f"saved rejected trajectory: {path}")
             if verbose:
                 seen_pairs: set[tuple[str, str]] = set()
                 for t, n1, n2 in unexpected:

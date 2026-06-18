@@ -26,15 +26,97 @@ from pick_and_place.camera_extrinsics import (
     load_local_camera_extrinsics,
 )
 from pick_and_place.camera_intrinsics import load_local_camera_intrinsics
+from pick_and_place.geometry import CUBE_HALF_SIZE
+from pick_and_place.workspace_overlays import is_cube_drop_allowed, is_vertical_grip_allowed
 
 
-def _rebuild_model(cube_start: np.ndarray) -> tuple[mujoco.MjModel, mujoco.MjData]:
+def _add_target_marker(spec: mujoco.MjSpec, target: np.ndarray | None) -> None:
+    """Add a visible, non-colliding floor marker for the requested drop target."""
+    if target is None:
+        return
+
+    x, y = float(target[0]), float(target[1])
+    body = spec.worldbody.add_body(name="replay_target_marker", pos=(x, y, 0.0))
+    body.add_geom(
+        name="replay_target_marker_square",
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        pos=(0.0, 0.0, 0.002),
+        size=(CUBE_HALF_SIZE, CUBE_HALF_SIZE, 0.001),
+        rgba=(0.0, 0.95, 0.35, 0.65),
+        contype=0,
+        conaffinity=0,
+    )
+    body.add_geom(
+        name="replay_target_marker_pin",
+        type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        pos=(0.0, 0.0, 0.04),
+        size=(0.004, 0.04),
+        rgba=(0.0, 0.45, 1.0, 0.85),
+        contype=0,
+        conaffinity=0,
+    )
+
+
+def _record_target(record: np.lib.npyio.NpzFile) -> np.ndarray | None:
+    if "target" in record:
+        return np.asarray(record["target"], dtype=float)
+    if "cube_target" in record:
+        return np.asarray(record["cube_target"], dtype=float)
+    return None
+
+
+def _add_collision_markers(
+    spec: mujoco.MjSpec,
+    events: np.ndarray | None,
+    *,
+    limit: int,
+) -> None:
+    """Add visible world-space markers for saved collision contact positions."""
+    if events is None or len(events) == 0 or limit <= 0:
+        return
+
+    marker_count = min(limit, len(events))
+    # Spread markers across the event list so long contacts show their path, and
+    # add the deepest penetration as a larger yellow marker.
+    indices = np.unique(np.linspace(0, len(events) - 1, marker_count, dtype=int))
+    for marker_index, event_index in enumerate(indices):
+        event = events[event_index]
+        spec.worldbody.add_geom(
+            name=f"replay_collision_marker_{marker_index:03d}",
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            pos=(float(event["x"]), float(event["y"]), float(event["z"]) + 0.003),
+            size=(0.004,),
+            rgba=(1.0, 0.05, 0.0, 0.85),
+            contype=0,
+            conaffinity=0,
+        )
+
+    deepest = events[int(np.argmin(events["dist"]))]
+    spec.worldbody.add_geom(
+        name="replay_collision_marker_deepest",
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        pos=(float(deepest["x"]), float(deepest["y"]), float(deepest["z"]) + 0.006),
+        size=(0.007,),
+        rgba=(1.0, 0.95, 0.0, 0.95),
+        contype=0,
+        conaffinity=0,
+    )
+
+
+def _rebuild_model(
+    cube_start: np.ndarray,
+    target: np.ndarray | None = None,
+    collision_events: np.ndarray | None = None,
+    collision_marker_limit: int = 64,
+) -> tuple[mujoco.MjModel, mujoco.MjData]:
     """Recompile the scene with the cube at the episode's recorded start pose.
 
     Matches ``pick_and_place.episodes`` exactly so the ``qpos`` layout lines up;
     the cube's free joint is what makes the logged ``qpos`` 13-wide.
     """
     spec = build_scene(include_environment=True)
+    _add_target_marker(spec, target)
+    _add_collision_markers(spec, collision_events, limit=collision_marker_limit)
     
     # Apply local calibration if present
     apply_camera_extrinsics_to_spec(spec, load_local_camera_extrinsics())
@@ -82,6 +164,7 @@ def _play_viewer(model: mujoco.MjModel, data: mujoco.MjData, qpos: np.ndarray, f
 
     period = 1.0 / fps
     with mujoco.viewer.launch_passive(model, data) as viewer:
+        viewer.opt.geomgroup[4] = 1
         while viewer.is_running():
             for frame in qpos:
                 if not viewer.is_running():
@@ -113,12 +196,40 @@ def main() -> None:
         default=None,
         help="playback fps (default: the episode's recorded control_hz)",
     )
+    parser.add_argument(
+        "--collision-marker-limit",
+        type=int,
+        default=64,
+        help="maximum saved collision contact points to mark in the replay scene",
+    )
     args = parser.parse_args()
 
     record = np.load(args.episode, allow_pickle=True)
     qpos = record["qpos"]
     fps = args.fps if args.fps is not None else float(record["control_hz"])
-    model, data = _rebuild_model(record["cube_start"])
+    target = _record_target(record)
+    if target is not None:
+        x, y = float(target[0]), float(target[1])
+        print(
+            f"target=({x:.4f}, {y:.4f}) "
+            f"vertical_grip_allowed={is_vertical_grip_allowed(x, y)} "
+            f"drop_allowed={is_cube_drop_allowed(x, y)}"
+        )
+    collision_events = record["collision_events"] if "collision_events" in record else None
+    if collision_events is not None and len(collision_events):
+        deepest = collision_events[int(np.argmin(collision_events["dist"]))]
+        print(
+            f"collision_events={len(collision_events)} deepest="
+            f"{-float(deepest['dist']) * 1000.0:.2f}mm "
+            f"{deepest['geom1']} <-> {deepest['geom2']} "
+            f"at t={float(deepest['time']):.3f}s"
+        )
+    model, data = _rebuild_model(
+        record["cube_start"],
+        target,
+        collision_events,
+        args.collision_marker_limit,
+    )
     if qpos.shape[1] != model.nq:
         raise ValueError(f"qpos width {qpos.shape[1]} != model.nq {model.nq}; scene mismatch")
 

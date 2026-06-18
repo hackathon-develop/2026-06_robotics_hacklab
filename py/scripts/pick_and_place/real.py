@@ -56,6 +56,11 @@ from pick_and_place.follower import (
 )
 from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
 from pick_and_place.kinematics import derive_kinematics
+from pick_and_place.paper_detection import (
+    PaperTracker,
+    detect_paper_target,
+    set_paper_target_marker,
+)
 from pick_and_place.safety import EpisodeAborted, recover_on
 from pick_and_place.trajectory import (
     GRIPPER_OPEN,
@@ -176,6 +181,83 @@ def track_cube(
     return None
 
 
+def track_drop_zone_square(
+    cap,
+    camera_name: str,
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    tracker: PaperTracker,
+    target_color: str,
+    timeout: float = CUBE_LOOK_TIMEOUT,
+) -> CubePose | None:
+    """Look for a black/white drop-zone square and return its center as a target."""
+    import cv2
+
+    from pick_and_place.camera_compare import load_intrinsics
+    from pick_and_place.camera_intrinsics import LOCAL_CAMERA_INTRINSICS_DIR
+    from pick_and_place.workspace_overlays import is_cube_drop_allowed
+
+    camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    cam_pos = data.cam_xpos[camera_id].copy()
+    cam_rot = data.cam_xmat[camera_id].reshape(3, 3).copy()
+
+    intrinsics = LOCAL_CAMERA_INTRINSICS_DIR / f"{camera_name}.json"
+    if intrinsics.exists():
+        camera_matrix, undistort_map = load_intrinsics(intrinsics, 1920, 1080, cv2)
+    else:
+        focal = (1080 / 2.0) / np.tan(np.radians(model.cam_fovy[camera_id]) / 2.0)
+        camera_matrix = np.array(
+            [[focal, 0, 1920 / 2.0], [0, focal, 1080 / 2.0], [0, 0, 1]], dtype=float
+        )
+        undistort_map = None
+
+    for _ in range(5):
+        cap.read()
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ok, bgr = cap.read()
+        if not ok or bgr is None:
+            continue
+
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if undistort_map is not None:
+            rgb = cv2.remap(rgb, *undistort_map, cv2.INTER_LINEAR)
+
+        raw_target = detect_paper_target(
+            rgb,
+            camera_matrix,
+            cam_pos,
+            cam_rot,
+            target_color=target_color,
+        )
+        target = tracker.update(raw_target)
+        if target is None:
+            continue
+
+        usable = is_cube_drop_allowed(*target.xy)
+        set_paper_target_marker(model, data, target, usable=usable)
+        if not usable:
+            print(
+                f"Drop zone seen at ({target.xy[0]:.3f}, {target.xy[1]:.3f}) "
+                "but outside the allowed drop zone."
+            )
+            continue
+
+        print(
+            f"Tracked drop zone: pos=({target.xy[0]:.3f}, {target.xy[1]:.3f}) "
+            f"yaw={np.degrees(target.yaw):.1f}deg"
+        )
+        return CubePose(
+            x=target.xy[0],
+            y=target.xy[1],
+            z=CUBE_HALF_SIZE,
+            yaw=float(target.yaw),
+        )
+
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -219,6 +301,25 @@ def main() -> None:
         help="pin the target (x, y); omit for a random pose in the clearance annulus",
     )
     parser.add_argument(
+        "--target-drop-zone",
+        dest="target_drop_zone",
+        action="store_true",
+        help="use the overhead camera to set the target from a black/white drop-zone square",
+    )
+    parser.add_argument(
+        "--show-drop-zone",
+        dest="show_drop_zone",
+        action="store_true",
+        help="show the tracked drop-zone square marker in the MuJoCo viewer",
+    )
+    parser.add_argument(
+        "--drop-zone-color",
+        dest="drop_zone_color",
+        choices=("black", "white"),
+        default="black",
+        help="color of the drop-zone square to detect (default: black)",
+    )
+    parser.add_argument(
         "--drop-orientation",
         choices=("free", "target"),
         default="free",
@@ -251,7 +352,33 @@ def main() -> None:
     parser.add_argument("--show-wrist-cam", action="store_true", help="show the live wrist camera feed")
     parser.add_argument("--show-wrist-mixed", action="store_true", help="overlay the sim render on the wrist feed")
     parser.add_argument("--no-viewer", action="store_true", help="run headless (no 3D MuJoCo viewer)")
+    parser.add_argument(
+        "--preflight-debug",
+        action="store_true",
+        help="print detailed collision diagnostics for rejected trajectory candidates",
+    )
+    parser.add_argument(
+        "--preflight-debug-limit",
+        type=int,
+        default=12,
+        help="maximum detailed contact rows to print per rejected candidate",
+    )
+    parser.add_argument(
+        "--save-failed-trajectories",
+        type=Path,
+        default=None,
+        help="directory for replayable .npz rollouts of rejected preflight candidates",
+    )
+    parser.add_argument(
+        "--failed-trajectory-limit",
+        type=int,
+        default=8,
+        help="maximum rejected candidates to save",
+    )
     args = parser.parse_args()
+
+    if args.target is not None and args.target_drop_zone:
+        parser.error("--target and --target-drop-zone are mutually exclusive")
 
     import cv2
 
@@ -266,7 +393,11 @@ def main() -> None:
     # prepare_episode repositions per episode, so a single viewer can stay bound.
     print("Building scene...")
     dummy_source = CubePose(x=PAN_AXIS[0] + 0.1, y=PAN_AXIS[1], z=CUBE_HALF_SIZE)
-    model, data = _build_model(dummy_source, include_environment=args.environment)
+    model, data = _build_model(
+        dummy_source,
+        include_environment=args.environment,
+        paper_target_marker=args.target_drop_zone or args.show_drop_zone,
+    )
     apply_camera_extrinsics_to_model(model, load_local_camera_extrinsics())
     mujoco.mj_forward(model, data)
 
@@ -303,6 +434,7 @@ def main() -> None:
         if args.target is not None
         else None
     )
+    drop_zone_tracker = PaperTracker() if (args.target_drop_zone or args.show_drop_zone) else None
 
     def read_current_sim_pose() -> tuple[dict[str, float], float]:
         """Read the real arm and convert to the sim joint frame."""
@@ -399,6 +531,22 @@ def main() -> None:
                     cooldown=lambda: cooldown(viewer),
                     should_continue=viewer.is_running,
                 ):
+                    episode_target = fixed_target
+                    if drop_zone_tracker is not None:
+                        tracked_target = track_drop_zone_square(
+                            overhead_cap,
+                            args.camera_name,
+                            model,
+                            data,
+                            drop_zone_tracker,
+                            args.drop_zone_color,
+                        )
+                        if args.target_drop_zone:
+                            if tracked_target is None:
+                                print("Drop-zone square not found. Ending loop.")
+                                break
+                            episode_target = tracked_target
+
                     source = hunt_for_cube(viewer)
                     if not viewer.is_running():
                         break
@@ -418,7 +566,7 @@ def main() -> None:
                             episode = prepare_episode(
                                 rng,
                                 source,
-                                fixed_target,
+                                episode_target,
                                 start_joints=current_joints,
                                 start_gripper=current_gripper,
                                 model=model,
@@ -427,6 +575,10 @@ def main() -> None:
                                 verbose=True,
                                 include_environment=args.environment,
                                 drop_orientation=args.drop_orientation,
+                                preflight_debug=args.preflight_debug,
+                                preflight_debug_limit=args.preflight_debug_limit,
+                                failed_trajectory_dir=args.save_failed_trajectories,
+                                failed_trajectory_limit=args.failed_trajectory_limit,
                             )
                         except EpisodeSamplingError:
                             print("No feasible plan from the current pose.")
@@ -450,6 +602,7 @@ def main() -> None:
                             wrist_intrinsics=args.wrist_intrinsics,
                             show_wrist_cam=args.show_wrist_cam,
                             show_wrist_mixed=args.show_wrist_mixed,
+                            failed_trajectory_dir=args.save_failed_trajectories,
                         )
 
                         if status == "restart":

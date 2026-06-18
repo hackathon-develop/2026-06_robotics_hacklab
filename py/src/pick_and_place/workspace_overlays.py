@@ -115,6 +115,11 @@ def is_cube_pickup_allowed(x: float, y: float) -> bool:
     return _is_cube_center_allowed(x, y, WORKSPACE_OVERLAYS[-1])
 
 
+def is_vertical_grip_allowed(x: float, y: float) -> bool:
+    """Return whether a floor cube can use the vertical gripper pose."""
+    return is_cube_pickup_allowed(x, y)
+
+
 def is_cube_drop_allowed(x: float, y: float) -> bool:
     """Return whether a cube-center drop target is in the broad arm workspace."""
     return _is_cube_center_allowed(x, y, CUBE_PLACEMENT_OVERLAY)

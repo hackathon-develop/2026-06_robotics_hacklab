@@ -21,7 +21,18 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from pick_and_place.episodes import Episode, _preflight, is_unexpected, scan_contacts
+from pick_and_place.episodes import (
+    Episode,
+    _preflight,
+    _preflight_collision_is_unexpected,
+    _save_failed_preflight_trajectory,
+    _write_failed_trajectory_note,
+    is_unexpected,
+    jaw_floor_clearance,
+    jaw_geom_ids,
+    scan_contacts,
+    set_joint,
+)
 from pick_and_place.follower import (
     ARM_JOINT_NAMES,
     GRIPPER_INDEX,
@@ -225,6 +236,7 @@ def execute_episode(
     wrist_intrinsics: str | None = None,
     show_wrist_cam: bool = False,
     show_wrist_mixed: bool = False,
+    failed_trajectory_dir: Path | str | None = None,
 ) -> str:
     """Run one pass of a prepared episode on an already-connected follower.
 
@@ -261,6 +273,9 @@ def execute_episode(
     trajectory = episode.trajectory
     start_joints = episode.start_joints
     start_gripper = episode.start_gripper
+    failed_trajectory_path = Path(failed_trajectory_dir) if failed_trajectory_dir is not None else None
+    if failed_trajectory_path is not None:
+        failed_trajectory_path.mkdir(parents=True, exist_ok=True)
 
     # With zero offsets the real frame is just the sim frame in degrees, so this
     # run also measures each joint's sim→real calibration bias (Phase 2 input).
@@ -635,6 +650,14 @@ def execute_episode(
             # Sense: get actual joints
             actual = action_to_joints(follower.get_observation(), commanded)
             measured_joints, measured_gripper = real_frame_to_sim(actual, offsets)
+            measured_shadow = mujoco.MjData(model)
+            for name, value in measured_joints.items():
+                set_joint(model, measured_shadow, name, value)
+            set_joint(model, measured_shadow, "gripper", measured_gripper)
+            mujoco.mj_forward(model, measured_shadow)
+            clearance = jaw_floor_clearance(model, measured_shadow, jaw_geom_ids(model))
+            if clearance < 0.005:
+                print(f"Measured sim jaw clearance before replan: {clearance * 1000:+.1f} mm")
             
             print(f"Replanning remaining trajectory after {completed_phase_name}...")
             candidate_traj = replan_remaining_phases(
@@ -652,15 +675,49 @@ def execute_episode(
             
             if candidate_traj is None:
                 print("Error: No feasible plan from current state. Aborting episode.")
+                _write_failed_trajectory_note(
+                    failed_trajectory_path,
+                    f"no feasible replan after {completed_phase_name}",
+                    source=dynamic_source,
+                    target=episode.target,
+                )
                 return "restart"
 
             # Preflight the newly planned remaining trajectory.
-            events = _preflight(model, candidate_traj, actuator_id, robot_geom_ids, env_geom_ids)
-            unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
+            if failed_trajectory_path is not None:
+                detail_events = _preflight(
+                    model,
+                    candidate_traj,
+                    actuator_id,
+                    robot_geom_ids,
+                    env_geom_ids,
+                    detailed=True,
+                )
+                unexpected_detail = [
+                    event for event in detail_events if _preflight_collision_is_unexpected(event)
+                ]
+                unexpected = [
+                    (event.time, event.geom1, event.geom2) for event in unexpected_detail
+                ]
+            else:
+                events = _preflight(model, candidate_traj, actuator_id, robot_geom_ids, env_geom_ids)
+                unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
             if unexpected:
                 print("Error: Replanned segment failed preflight. Aborting episode.")
                 for t, n1, n2 in unexpected:
                     print(f"  collision t={t:.3f}s {n1} ↔ {n2}")
+                if failed_trajectory_path is not None:
+                    path = failed_trajectory_path / (
+                        f"replan_after_{completed_phase_name or 'start'}_failed.npz"
+                    )
+                    _save_failed_preflight_trajectory(
+                        path,
+                        model,
+                        candidate_traj,
+                        actuator_id,
+                        unexpected_detail,
+                    )
+                    print(f"saved rejected replan trajectory: {path}")
                 return "restart"
 
             current_traj = candidate_traj

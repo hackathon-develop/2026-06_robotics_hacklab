@@ -40,7 +40,15 @@ from pick_and_place.cube_detection import (
     CubeTracker,
     detect_tags,
 )
+from pick_and_place.paper_detection import (
+    PaperTracker,
+    add_paper_target_marker,
+    detect_paper_target,
+    draw_paper_target,
+    set_paper_target_marker,
+)
 from pick_and_place.scene import build_scene
+from pick_and_place.workspace_overlays import is_cube_drop_allowed
 from pick_and_place.follower import (
     ARM_JOINT_NAMES,
     action_to_joints,
@@ -212,6 +220,26 @@ def main() -> None:
         help="detect the AprilTag cube each frame and mirror it into the sim (overhead only)",
     )
     parser.add_argument(
+        "--track-drop-zone",
+        dest="track_drop_zone",
+        action="store_true",
+        help="detect a square drop-zone target each frame and mirror it into the sim (overhead only)",
+    )
+    parser.add_argument(
+        "--drop-zone-smooth",
+        dest="drop_zone_smooth",
+        type=float,
+        default=0.3,
+        help="drop-zone pose EMA factor 0..1 (0 = none, higher = steadier but laggier)",
+    )
+    parser.add_argument(
+        "--drop-zone-color",
+        dest="drop_zone_color",
+        choices=["black", "white"],
+        default="black",
+        help="color of the drop-zone square to detect",
+    )
+    parser.add_argument(
         "--cube-smooth",
         type=float,
         default=0.3,
@@ -258,9 +286,13 @@ def main() -> None:
 
     if args.track_cube and not has_overhead:
         parser.error("--track-cube requires --overhead-camera or --real-image")
+    if args.track_drop_zone and not has_overhead:
+        parser.error("--track-drop-zone requires --overhead-camera or --real-image")
 
     # 1. Build the scene with robot and environment
     spec = build_scene(wrist_camera=True, include_environment=True)
+    if args.track_drop_zone:
+        add_paper_target_marker(spec)
     
     # Ensure the offscreen framebuffer is large enough for the requested render size
     spec.visual.global_.offwidth = max(spec.visual.global_.offwidth, args.width)
@@ -314,6 +346,8 @@ def main() -> None:
 
     # 4. Initialize renderer and camera source
     renderer = mujoco.Renderer(model, width=args.width, height=args.height)
+    if args.track_drop_zone:
+        renderer._scene_option.geomgroup[1] = True
     real = None
     if has_overhead:
         real = RealSource(
@@ -360,22 +394,26 @@ def main() -> None:
     # possible -- corner noise, and the pose jitter it causes, scale with how few
     # pixels the tag spans.
     cube_tracker = None
+    drop_zone_tracker = None
     cube_body_id = -1
     detection_matrix = None
     detection_map = None
     detection_size = (args.camera_width, args.camera_height)
     committed_position = None
     committed_rotation = None
-    if args.track_cube:
-        cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pick_cube")
-        if cube_body_id < 0:
-            raise SystemExit("scene has no 'pick_cube' body to track")
-        cube_tracker = CubeTracker(
-            smooth=args.cube_smooth,
-            history=args.cube_history,
-            single_face_weight=args.cube_single_face_weight,
-            quad_decimate=args.cube_quad_decimate,
-        )
+    if args.track_cube or args.track_drop_zone:
+        if args.track_cube:
+            cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pick_cube")
+            if cube_body_id < 0:
+                raise SystemExit("scene has no 'pick_cube' body to track")
+            cube_tracker = CubeTracker(
+                smooth=args.cube_smooth,
+                history=args.cube_history,
+                single_face_weight=args.cube_single_face_weight,
+                quad_decimate=args.cube_quad_decimate,
+            )
+        if args.track_drop_zone:
+            drop_zone_tracker = PaperTracker(alpha=args.drop_zone_smooth)
         if intrinsics is not None:
             detection_matrix, detection_map = load_intrinsics(intrinsics, *detection_size, cv2)
         else:
@@ -384,7 +422,7 @@ def main() -> None:
                 [[focal, 0, args.camera_width / 2.0], [0, focal, args.camera_height / 2.0], [0, 0, 1]],
                 dtype=float,
             )
-            print("Warning: tracking the cube on a raw frame; calibrated intrinsics recommended")
+            print("Warning: tracking on a raw frame; calibrated intrinsics recommended")
 
     # 6. Connect to leader and follower
     offsets = load_follower_joint_offsets(args.offsets_path)
@@ -491,50 +529,75 @@ def main() -> None:
                 mujoco.mj_step(model, data)
 
             out = None
+            drop_zone_target = None
             if has_overhead:
                 frame = real.read(args.width, args.height)
                 if undistort_map is not None:
                     frame = cv2.remap(frame, *undistort_map, cv2.INTER_LINEAR)
 
             cube_status = None
+            drop_zone_status = None
             tag_detections = []
-            if cube_tracker is not None and has_overhead:
+            if (cube_tracker is not None or drop_zone_tracker is not None) and has_overhead:
                 det_frame = real.read(*detection_size)
                 if detection_map is not None:
                     det_frame = cv2.remap(det_frame, *detection_map, cv2.INTER_LINEAR)
-                tag_detections = detect_tags(det_frame, cube_tracker.detector)
-                cube_detections = [d for d in tag_detections if d.tag_id in CUBE_TAG_IDS]
-                pose = cube_tracker.update(
-                    cube_detections,
-                    detection_matrix,
-                    data.cam_xpos[camera_id],
-                    data.cam_xmat[camera_id].reshape(3, 3),
-                )
-                if pose is None:
-                    cube_status = "cube: no tags"
-                else:
-                    moved = False
-                    if not pose.held:
-                        moved = (
-                            committed_position is None
-                            or float(np.linalg.norm(pose.position - committed_position)) * 1000.0
-                            > args.cube_deadband_mm
-                            or _rotation_angle_deg(pose.rotation, committed_rotation)
-                            > args.cube_deadband_deg
-                        )
-                        if moved:
-                            quat = np.empty(4)
-                            mujoco.mju_mat2Quat(quat, pose.rotation.reshape(-1))
-                            model.body_pos[cube_body_id] = pose.position
-                            model.body_quat[cube_body_id] = quat
-                            committed_position, committed_rotation = pose.position, pose.rotation
-                            mujoco.mj_forward(model, data)
-                    cube_status = (
-                        f"cube: {pose.num_faces} face(s) "
-                        f"ids={list(pose.face_ids)} reproj {pose.reproj_px:.2f}px "
-                        f"flips {pose.flip_rate:.0%}"
-                        f"{'  (held)' if pose.held else '' if moved else '  (steady)'}"
+                det_rgb = det_frame
+
+                if drop_zone_tracker is not None:
+                    raw_drop_zone_target = detect_paper_target(
+                        det_rgb,
+                        detection_matrix,
+                        data.cam_xpos[camera_id],
+                        data.cam_xmat[camera_id].reshape(3, 3),
+                        target_color=args.drop_zone_color,
                     )
+                    drop_zone_target = drop_zone_tracker.update(raw_drop_zone_target)
+                    if drop_zone_target is None:
+                        drop_zone_status = "drop zone: not seen"
+                    else:
+                        usable = is_cube_drop_allowed(*drop_zone_target.xy)
+                        set_paper_target_marker(model, data, drop_zone_target, usable=usable)
+                        drop_zone_status = (
+                            f"drop zone: xy=({drop_zone_target.xy[0]:.3f}, {drop_zone_target.xy[1]:.3f}) "
+                            f"yaw={np.degrees(drop_zone_target.yaw):.1f}deg "
+                            f"{'(usable)' if usable else '(out of bounds)'}"
+                        )
+
+                if cube_tracker is not None:
+                    tag_detections = detect_tags(det_rgb, cube_tracker.detector)
+                    cube_detections = [d for d in tag_detections if d.tag_id in CUBE_TAG_IDS]
+                    pose = cube_tracker.update(
+                        cube_detections,
+                        detection_matrix,
+                        data.cam_xpos[camera_id],
+                        data.cam_xmat[camera_id].reshape(3, 3),
+                    )
+                    if pose is None:
+                        cube_status = "cube: no tags"
+                    else:
+                        moved = False
+                        if not pose.held:
+                            moved = (
+                                committed_position is None
+                                or float(np.linalg.norm(pose.position - committed_position)) * 1000.0
+                                > args.cube_deadband_mm
+                                or _rotation_angle_deg(pose.rotation, committed_rotation)
+                                > args.cube_deadband_deg
+                            )
+                            if moved:
+                                quat = np.empty(4)
+                                mujoco.mju_mat2Quat(quat, pose.rotation.reshape(-1))
+                                model.body_pos[cube_body_id] = pose.position
+                                model.body_quat[cube_body_id] = quat
+                                committed_position, committed_rotation = pose.position, pose.rotation
+                                mujoco.mj_forward(model, data)
+                        cube_status = (
+                            f"cube: {pose.num_faces} face(s) "
+                            f"ids={list(pose.face_ids)} reproj {pose.reproj_px:.2f}px "
+                            f"flips {pose.flip_rate:.0%}"
+                            f"{'  (held)' if pose.held else '' if moved else '  (steady)'}"
+                        )
 
             sim = None
             if has_overhead:
@@ -583,12 +646,20 @@ def main() -> None:
                     blended = cv2.addWeighted(frame, alpha, sim, 1.0 - alpha, 0.0)
                     out = cv2.cvtColor(blended, cv2.COLOR_RGB2BGR)
 
+                if drop_zone_target is not None:
+                    draw_paper_target(
+                        out,
+                        drop_zone_target,
+                        args.width / detection_size[0],
+                        args.height / detection_size[1],
+                    )
+
                 if tag_detections:
                     draw_tag_detections(
                         out,
                         tag_detections,
-                        args.width / frame.shape[1],
-                        args.height / frame.shape[0],
+                        args.width / detection_size[0],
+                        args.height / detection_size[1],
                     )
 
                 out = draw_hud(out, mode=mode, alpha=alpha, intrinsics=intrinsics)
@@ -597,6 +668,14 @@ def main() -> None:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                     cv2.putText(out, cube_status, (10, out.shape[0] - 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+                if drop_zone_status is not None:
+                    y = out.shape[0] - 12
+                    if cube_status is not None:
+                        y -= 25
+                    cv2.putText(out, drop_zone_status, (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(out, drop_zone_status, (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.imshow(WINDOW_TITLE, out)
 
             if wrist_out is not None:

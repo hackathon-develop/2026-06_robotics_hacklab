@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import mujoco
 import mujoco.viewer
@@ -29,6 +30,7 @@ import numpy as np
 
 from pick_and_place.episodes import (
     Episode,
+    EpisodeSamplingError,
     is_unexpected,
     prepare_episode,
     scan_contacts,
@@ -110,6 +112,34 @@ def main() -> None:
         action="store_true",
         help="include the calibration workspace_frame and overhead camera mount in the scene",
     )
+    parser.add_argument(
+        "--preflight-debug",
+        action="store_true",
+        help="print detailed collision diagnostics for rejected trajectory candidates",
+    )
+    parser.add_argument(
+        "--preflight-debug-limit",
+        type=int,
+        default=12,
+        help="maximum detailed contact rows to print per rejected candidate",
+    )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="prepare and preflight the episode, then exit without opening the viewer",
+    )
+    parser.add_argument(
+        "--save-failed-trajectories",
+        type=Path,
+        default=None,
+        help="directory for replayable .npz rollouts of rejected preflight candidates",
+    )
+    parser.add_argument(
+        "--failed-trajectory-limit",
+        type=int,
+        default=8,
+        help="maximum rejected candidates to save",
+    )
     args = parser.parse_args()
 
     if args.speed <= 0.0:
@@ -126,14 +156,30 @@ def main() -> None:
         else None
     )
 
-    episode = prepare_episode(
-        np.random.default_rng(),
-        source,
-        target,
-        verbose=True,
-        include_environment=args.environment,
-        drop_orientation=args.drop_orientation,
-    )
+    try:
+        episode = prepare_episode(
+            np.random.default_rng(),
+            source,
+            target,
+            verbose=True,
+            include_environment=args.environment,
+            drop_orientation=args.drop_orientation,
+            preflight_debug=args.preflight_debug,
+            preflight_debug_limit=args.preflight_debug_limit,
+            failed_trajectory_dir=args.save_failed_trajectories,
+            failed_trajectory_limit=args.failed_trajectory_limit,
+        )
+    except EpisodeSamplingError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if args.plan_only:
+        print(
+            f"planned source=({episode.source.x:.3f}, {episode.source.y:.3f}) "
+            f"target=({episode.target.x:.3f}, {episode.target.y:.3f}) "
+            f"grasp={episode.grasp.face}/{episode.grasp.elbow} "
+            f"carry={episode.trajectory.carry.mode} attempts={episode.attempts}"
+        )
+        return
 
     _play(episode, args.speed)
 
