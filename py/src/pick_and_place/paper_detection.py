@@ -12,6 +12,10 @@ from numpy.typing import NDArray
 
 PAPER_TARGET_MARKER_NAME = "paper_target_marker"
 
+# Half side length (metres) of the standard black drop-zone square. Real
+# recordings detect the physical paper's size; sim renders a square of this size.
+DROP_ZONE_HALF_SIZE = 0.05
+
 
 @dataclass(frozen=True)
 class PaperTarget:
@@ -164,8 +168,23 @@ def add_paper_target_marker(spec) -> None:
     )
 
 
-def set_paper_target_marker(model, data, target: PaperTarget, *, usable: bool) -> None:
-    """Show ``target`` as a translucent square in an already compiled model."""
+def place_paper_target_marker(
+    model,
+    center_xy: tuple[float, float],
+    yaw: float,
+    half_extent: tuple[float, float],
+    *,
+    usable: bool,
+    alpha: float = 0.72,
+) -> None:
+    """Position and show the drop-zone marker square in an already compiled model.
+
+    ``half_extent`` is the half side length (metres) along the marker's local x/y
+    axes. ``usable`` colours the square the standard black when the drop is allowed
+    and orange when it falls outside the permitted drop zone. ``alpha`` is the
+    opacity: the live viewer overlays a translucent square, while a sim recording
+    uses a fully opaque square to look like real black paper on the table.
+    """
     import math
     import mujoco
 
@@ -174,18 +193,32 @@ def set_paper_target_marker(model, data, target: PaperTarget, *, usable: bool) -
     if body_id < 0 or geom_id < 0:
         return
 
-    edge_x = target.corners_world[1] - target.corners_world[0]
-    edge_y = target.corners_world[2] - target.corners_world[1]
-    model.body_pos[body_id] = (*target.center_world[:2], 0.0)
-    yaw = target.yaw
+    model.body_pos[body_id] = (center_xy[0], center_xy[1], 0.0)
     model.body_quat[body_id] = (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0))
     model.geom_size[geom_id] = (
-        max(float(np.linalg.norm(edge_x[:2])) / 2.0, 0.001),
-        max(float(np.linalg.norm(edge_y[:2])) / 2.0, 0.001),
+        max(half_extent[0], 0.001),
+        max(half_extent[1], 0.001),
         0.001,
     )
-    model.geom_rgba[geom_id] = (
-        (0.12, 0.12, 0.12, 0.72) if usable else (1.0, 0.45, 0.05, 0.65)
+    rgb = (0.12, 0.12, 0.12) if usable else (1.0, 0.45, 0.05)
+    model.geom_rgba[geom_id] = (*rgb, alpha)
+
+
+def set_paper_target_marker(model, data, target: PaperTarget, *, usable: bool) -> None:
+    """Show a detected ``target`` as a translucent square in a compiled model."""
+    import mujoco
+
+    edge_x = target.corners_world[1] - target.corners_world[0]
+    edge_y = target.corners_world[2] - target.corners_world[1]
+    place_paper_target_marker(
+        model,
+        (float(target.center_world[0]), float(target.center_world[1])),
+        target.yaw,
+        (
+            float(np.linalg.norm(edge_x[:2])) / 2.0,
+            float(np.linalg.norm(edge_y[:2])) / 2.0,
+        ),
+        usable=usable,
     )
     mujoco.mj_forward(model, data)
 

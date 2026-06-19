@@ -271,6 +271,21 @@ class RecordingSession:
             video_backend="pyav",
         )
 
+    def dropped_frame_count(self) -> int:
+        """Frames the streaming video encoder dropped in the current episode.
+
+        The encoder silently drops a frame when its queue backs up (it can't keep
+        pace with capture), which leaves the video shorter than the recorded rows
+        and corrupts the episode. Returns 0 in PNG mode (no such queue) or before
+        the dataset exists.
+        """
+        if self.dataset is None:
+            return 0
+        encoder = getattr(self.dataset.writer, "_streaming_encoder", None)
+        if encoder is None:
+            return 0
+        return sum(encoder._dropped_frames.values())
+
     def finalize(self) -> None:
         if self.dataset is not None:
             self.dataset.finalize()
@@ -1015,6 +1030,17 @@ def execute_episode(
             record_writer_thread.join(timeout=30.0)
         _report_tracking(recorder)
         if recording is not None and recording.dataset is not None and record_writer_thread is not None:
+            # The writer thread has drained, so the drop count now covers the whole
+            # episode. A dropped frame would desync the video from the recorded rows,
+            # so fail before committing rather than save a corrupt episode.
+            dropped = recording.dropped_frame_count()
+            if dropped:
+                raise RuntimeError(
+                    f"Streaming video encoder dropped {dropped} frame(s): the encoder "
+                    "cannot keep pace with capture, which would desync the video from the "
+                    "recorded frames. Use a hardware vcodec (auto) or raise the encoder "
+                    "queue size."
+                )
             if episode_status == "success":
                 recording.dataset.save_episode()
                 print(f"Saved episode to dataset ({len(recorder)} frames).")

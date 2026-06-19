@@ -155,6 +155,11 @@ def set_joint(model: mujoco.MjModel, data: mujoco.MjData, name: str, value: floa
     data.qpos[model.jnt_qposadr[jid]] = value
 
 
+def get_joint(model: mujoco.MjModel, data: mujoco.MjData, name: str) -> float:
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    return float(data.qpos[model.jnt_qposadr[jid]])
+
+
 def set_cube_pose(model: mujoco.MjModel, data: mujoco.MjData, source: CubePose) -> None:
     """Move the freejoint ``pick_cube`` to ``source`` in an existing model's data.
 
