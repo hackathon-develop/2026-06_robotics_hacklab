@@ -10,14 +10,20 @@ control tick it snapshots the latest overhead and wrist frames, reads the
 follower's joints, runs ``select_action``, and streams the predicted joints back
 to the arm as position targets.
 
-It is *simpler* than the sim run because no frame conversion is needed. The
-follower already reports and accepts the exact real frame the dataset was
-recorded in — arm joints in degrees, gripper as a 0-100 position — which is the
-frame SmolVLA's state and action live in. So the follower's reading is the
-observation state verbatim, and the predicted action is sent verbatim (clamped
-to the joint limits). There are no sim→real offsets and no radians anywhere on
-the policy path; MuJoCo is loaded only to derive those joint limits and the
-neutral start pose.
+It is *simpler* than the sim run on the proprioception side because no frame
+conversion is needed. The follower already reports and accepts the exact real
+frame the dataset was recorded in — arm joints in degrees, gripper as a 0-100
+position — which is the frame SmolVLA's state and action live in. So the
+follower's reading is the observation state verbatim, and the predicted action
+is sent verbatim (clamped to the joint limits). There are no sim→real offsets
+and no radians anywhere on the policy path; MuJoCo is loaded only to derive
+those joint limits and the neutral start pose.
+
+The cameras do need conversion: each raw, lens-distorted frame is undistorted
+with its calibrated intrinsics, center-cropped to a square, and resized to
+512x512 every tick, via the same geometry ``convert_dataset_to_square.py``
+applies to recorded datasets — so the live frames fed to the policy match the
+ones it was fine-tuned on, pixel-geometry for pixel-geometry.
 
 ``--checkpoint`` selects the policy; the default ``lerobot/smolvla_base`` is an
 un-finetuned plumbing spike (the arm moves but does not solve the task). A
@@ -43,6 +49,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import numpy as np
 
 from pick_and_place import build_scene
+from pick_and_place.camera_intrinsics import load_local_camera_intrinsics
 from pick_and_place.executor import (
     CONTROL_HZ,
     RAMP_DURATION,
@@ -58,6 +65,7 @@ from pick_and_place.follower import (
     make_so101_follower,
     sim_frame_to_real,
 )
+from pick_and_place.image_rectify import SQUARE_SIZE, build_undistort_map, transform_frame
 from pick_and_place.kinematics import derive_kinematics
 from pick_and_place.trajectory import (
     NEUTRAL_ARM_JOINTS,
@@ -213,18 +221,31 @@ def main() -> None:
 
     from lerobot.utils.control_utils import predict_action
 
+    intrinsics_by_camera = load_local_camera_intrinsics()
+    missing = [cam for cam in ("overhead_camera", "wrist_camera") if cam not in intrinsics_by_camera]
+    if missing:
+        raise SystemExit(f"no calibrated intrinsics for {missing}; cannot undistort")
+
     print("Opening cameras...")
     overhead = CameraReader(args.camera, 1920, 1080, "overhead")
     wrist = CameraReader(args.wrist_camera, 1280, 720, "wrist")
     first_overhead = overhead.wait_for_first()
     first_wrist = wrist.wait_for_first()
 
-    # Declare each camera's native shape so the policy loads against the same
-    # frames it was fine-tuned on; SmolVLA resizes both to its square input.
+    # Every frame is rectified to the same SQUARE_SIZE square pinhole view the
+    # offline dataset conversion produces, so the policy loads against that
+    # fixed shape regardless of either camera's native resolution.
+    overhead_undistort_map = build_undistort_map(
+        intrinsics_by_camera["overhead_camera"], first_overhead.shape[1], first_overhead.shape[0], cv2
+    )
+    wrist_undistort_map = build_undistort_map(
+        intrinsics_by_camera["wrist_camera"], first_wrist.shape[1], first_wrist.shape[0], cv2
+    )
+
     policy, preprocessor, postprocessor = make_policy(
         args.checkpoint,
-        wrist_hw=first_wrist.shape[:2],
-        overhead_hw=first_overhead.shape[:2],
+        wrist_hw=(SQUARE_SIZE, SQUARE_SIZE),
+        overhead_hw=(SQUARE_SIZE, SQUARE_SIZE),
         device=device,
     )
     policy.reset()
@@ -267,6 +288,8 @@ def main() -> None:
             wrist_bgr = wrist.latest()
             overhead_rgb = cv2.cvtColor(overhead_bgr, cv2.COLOR_BGR2RGB)
             wrist_rgb = cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB)
+            overhead_rgb = transform_frame(overhead_rgb, overhead_undistort_map, SQUARE_SIZE, cv2)
+            wrist_rgb = transform_frame(wrist_rgb, wrist_undistort_map, SQUARE_SIZE, cv2)
 
             state = action_to_joints(follower.get_observation(), neutral_real).astype(np.float32)
             observation = {

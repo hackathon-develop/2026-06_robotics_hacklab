@@ -42,9 +42,7 @@ from pick_and_place.follower import (
     JOINT_NAMES,
     sim_frame_to_real,
 )
-
-# Side length of the square camera images, matching the SmolVLA vision tower.
-SQUARE_SIZE = 512
+from pick_and_place.image_rectify import SQUARE_SIZE
 
 WRIST_CAMERA = "wrist_camera"
 OVERHEAD_CAMERA = "overhead_camera"
