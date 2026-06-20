@@ -157,9 +157,12 @@ Out of the box, standard YOLO26 models (Nano, Small, Medium, Large, and Extra-La
 
 # imagenet 
 
+## imagenet 1k classes
+
 The human-readable class names for the 1,000 categories used in the ImageNet Large Scale Visual Recognition Challenge (ILSVRC) can be found in a few standard source files, depending on the framework or repository you are working with.
 
 Because ImageNet organizes its images using WordNet (a lexical database of English), the original categories are identified by "synsets" (WordNet IDs) like `n01440764`. Various source files are used to map these IDs or numerical indices (0-999) to human-readable names.
+
 
 ### Common ImageNet Class Source Files
 
@@ -225,6 +228,39 @@ The names below are shown as they appear in the official ImageNet class list:
 * `hair spray`
 * `lotion`
 * `paper towel`
+
+
+
+Here is a list of tool-related classes that are included in the official **1,000 ImageNet (ILSVRC) classes** and could typically be found on a workbench or work table.
+
+First, a quick point of clarification on your examples: while **`screwdriver`** is indeed an official ImageNet class, **scissors** are actually *not* part of the standard 1,000 ImageNet categories. (You might be remembering "scissors" from the YOLO/COCO dataset we discussed earlier!).
+
+Here are the exact, human-readable class names for tools and hardware found in the standard ImageNet list:
+
+### **Hand Tools & Measuring**
+
+* `screwdriver`
+* `hammer`
+* `plane, carpenter's plane, woodworking plane`
+* `rule, ruler`
+* `hatchet`
+* `cleaver, meat cleaver, chopper` *(Though typically found on a butcher block rather than a standard workbench)*
+
+### **Power Tools**
+
+* `power drill`
+* `chain saw, chainsaw`
+
+### **Tool Collections & Accessories**
+
+* `carpenter's kit, tool kit`
+* `padlock`
+* `combination lock`
+* `chain`
+
+*(Note: Items like wrenches, pliers, and tape measures are part of the broader, much larger ImageNet-21k dataset, but they did not make the cut for the famous 1,000-class subset used in most standard classification benchmarks.)*
+
+
 
 
 # appendix 
