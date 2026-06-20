@@ -270,6 +270,24 @@ def parse_args() -> argparse.Namespace:
         help="Table surface height in world frame (default: 0.0).",
     )
     parser.add_argument(
+        "--rx",
+        type=float,
+        default=180.0,
+        help="Gripper rotation around X in degrees (default: 180 = pointing straight down).",
+    )
+    parser.add_argument(
+        "--ry",
+        type=float,
+        default=0.0,
+        help="Gripper rotation around Y in degrees (default: 0).",
+    )
+    parser.add_argument(
+        "--rz",
+        type=float,
+        default=0.0,
+        help="Gripper rotation around Z in degrees (default: 0). Set to match object yaw if known.",
+    )
+    parser.add_argument(
         "--max-hz",
         type=float,
         default=10.0,
@@ -300,6 +318,7 @@ def main() -> None:
     cam_pos = np.array(args.cam_pos, dtype=float)
     cam_rot = np.array(args.cam_xmat, dtype=float).reshape(3, 3)
     pick_z = args.pick_z
+    rx, ry, rz = args.rx, args.ry, args.rz
 
     # --- target class ---
     target_classes = [normalize_label(args.target_class)] if args.target_class.strip() else []
@@ -316,6 +335,9 @@ def main() -> None:
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera {args.camera_id}.")
     print(f"Opened camera {args.camera_id}. Press q to quit.")
+
+    window_name = "pick_pose — press q to quit"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     min_interval = 1.0 / max(args.max_hz, 1.0)
     last_t = 0.0
@@ -360,7 +382,8 @@ def main() -> None:
                     print(
                         f"  PICK label={best['label']} conf={best['confidence']:.2f} "
                         f"pixel=({best['cx']:.1f}, {best['cy']:.1f}) "
-                        f"world=({world_x:.4f}, {world_y:.4f}, {pick_z:.4f})"
+                        f"world=({world_x:.4f}, {world_y:.4f}, {pick_z:.4f}, "
+                        f"{rx:.2f}, {ry:.2f}, {rz:.2f})"
                     )
                 except ValueError as exc:
                     print(f"  SKIP {exc}")
@@ -369,7 +392,7 @@ def main() -> None:
                 print(f"  No detections for {target_desc}.")
 
             _annotate_frame(frame, detections)
-            cv2.imshow("pick_pose — press q to quit", frame)
+            cv2.imshow(window_name, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
