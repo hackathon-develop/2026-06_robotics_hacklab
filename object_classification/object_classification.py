@@ -1086,6 +1086,47 @@ def yolo_world_tool_classes(target_class: str | None = None) -> list[str]:
     return TOOL_CLASS_NAMES
 
 
+def imagenet21k_classes(labels_path: Path | None = None, target_class: str | None = None) -> list[str]:
+    if target_class:
+        return [normalize_label(target_class)]
+
+    return load_imagenet21k_class_names(labels_path)
+
+
+def run_yolo_world_tools_detection(image: Any, confidence: float, target_class: str | None = None) -> None:
+    configure_model_environment()
+
+    try:
+        from ultralytics import YOLOWorld
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
+
+    model = YOLOWorld(YOLO_WORLD_TOOLS_WEIGHTS)
+    model.set_classes(yolo_world_tool_classes(target_class))
+    results = model.predict(source=image, conf=confidence, verbose=False)
+    print_yolo_detections(results, target_class=target_class)
+
+
+def run_imagenet21k_detection(
+    image: Any,
+    confidence: float,
+    labels_path: Path | None = None,
+    target_class: str | None = None,
+) -> None:
+    configure_model_environment()
+
+    try:
+        from ultralytics import YOLOWorld
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
+
+    class_names = imagenet21k_classes(labels_path, target_class=target_class)
+    model = YOLOWorld(YOLO_WORLD_TOOLS_WEIGHTS)
+    model.set_classes(class_names)
+    results = model.predict(source=image, conf=confidence, verbose=False)
+    print_yolo_detections(results, target_class=target_class, class_name_lookup=class_names)
+
+
 def run_yolo_world_tools_detection(image: Any, confidence: float, target_class: str | None = None) -> None:
     configure_model_environment()
 
