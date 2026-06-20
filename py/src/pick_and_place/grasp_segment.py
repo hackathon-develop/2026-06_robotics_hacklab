@@ -118,6 +118,24 @@ class GraspSegmentResult:
     ticks: int
 
 
+def _action_chunk_depth(policy) -> tuple[int, int] | None:
+    """Remaining actions in the policy's current chunk and the chunk size, or
+    ``None`` for a policy that does not queue chunks. SmolVLA predicts a chunk of
+    ``n_action_steps`` actions at once and dequeues one per tick, so the depth
+    counts down to 0 and then a fresh chunk refills it."""
+    queues = getattr(policy, "_queues", None)
+    config = getattr(policy, "config", None)
+    chunk_size = getattr(config, "n_action_steps", None)
+    if not queues or chunk_size is None:
+        return None
+    from lerobot.utils.constants import ACTION
+
+    queue = queues.get(ACTION)
+    if queue is None:
+        return None
+    return len(queue), int(chunk_size)
+
+
 def run_grasp_segment(
     env: GraspEnv,
     policy_bundle: tuple,
@@ -126,6 +144,7 @@ def run_grasp_segment(
     device,
     max_ticks: int,
     control_hz: float,
+    log_every: int = 1,
 ) -> GraspSegmentResult:
     """Drive the policy closed-loop until the detector fires or the tick budget runs out.
 
@@ -133,6 +152,12 @@ def run_grasp_segment(
     ``vla.make_policy``. Each tick renders the two cameras, builds the observation
     a LeRobot policy expects, queries one action, applies it in the real frame, and
     feeds the new TCP height to ``detector``. Paced to ``control_hz``.
+
+    When ``log_every`` is positive, every ``log_every``-th tick prints the TCP
+    height (with the detector's descend/ascent state), the gripper command, the
+    position within the current action chunk (``k/n``, marked ``*`` on the tick a
+    fresh chunk was just predicted), and the applied action vector. Set
+    ``log_every=0`` to silence it.
     """
     from lerobot.utils.control_utils import predict_action
 
@@ -161,7 +186,28 @@ def run_grasp_segment(
         action_real = action.to("cpu").numpy().reshape(-1)[: len(JOINT_NAMES)]
         env.apply_action(action_real)
 
-        if detector.update(env.tcp_z(), float(action_real[GRIPPER_INDEX])):
+        z = env.tcp_z()
+        done = detector.update(z, float(action_real[GRIPPER_INDEX]))
+
+        if log_every and tick % log_every == 0:
+            chunk = _action_chunk_depth(policy)
+            if chunk is None:
+                chunk_str = ""
+            else:
+                depth, size = chunk
+                # A just-predicted chunk has ``size`` actions and one is popped
+                # before we see it here, so depth == size - 1 marks a new chunk.
+                fresh = "*" if depth == size - 1 else " "
+                chunk_str = f" chunk {size - depth}/{size}{fresh}"
+            state = "DESC" if detector.descending else "hover"
+            with np.printoptions(precision=1, suppress=True):
+                print(
+                    f"  vla {tick:3d} | z={z:.3f} {state} "
+                    f"zmin={detector.z_min:.3f} | grip={action_real[GRIPPER_INDEX]:5.1f}"
+                    f"{chunk_str} | act={action_real}"
+                )
+
+        if done:
             return GraspSegmentResult(done=True, timed_out=False, ticks=tick + 1)
 
         remaining = period - (time.time() - tick_start)

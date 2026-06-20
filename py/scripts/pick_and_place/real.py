@@ -62,6 +62,7 @@ from pick_and_place.follower import (
     sim_frame_to_real,
 )
 from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
+from pick_and_place.grasp_segment import ASCENT_MARGIN, DESCENT_MARGIN
 from pick_and_place.kinematics import derive_kinematics
 from pick_and_place.paper_detection import (
     PaperTracker,
@@ -76,6 +77,7 @@ from pick_and_place.trajectory import (
     REST_ARM_JOINTS,
     REST_GRIPPER,
 )
+from pick_and_place.vla import DEFAULT_INSTRUCTION
 
 # How long a single look attempt stares at the camera feed before giving up and
 # moving to a fresh near-neutral pose to try again.
@@ -437,6 +439,42 @@ def main() -> None:
         default=4,
         help="background image-writer threads LeRobot uses for PNG-then-encode mode",
     )
+    parser.add_argument(
+        "--vla-checkpoint",
+        default=None,
+        help="HF SmolVLA checkpoint that drives the descend->grasp->lift segment; "
+        "omit to keep the classical PBVS descent. Recording is disabled in this mode",
+    )
+    parser.add_argument(
+        "--vla-instruction",
+        default=DEFAULT_INSTRUCTION,
+        help="language task string fed to the VLA policy",
+    )
+    parser.add_argument("--vla-device", default="auto", help="VLA torch device: auto | cpu | mps | cuda")
+    parser.add_argument(
+        "--grasp-max-ticks",
+        type=int,
+        default=900,
+        help="safety budget of control ticks for the VLA segment before it times out",
+    )
+    parser.add_argument(
+        "--grasp-max-joint-speed",
+        type=float,
+        default=10.0,
+        help="per-joint velocity cap (deg/s) on VLA actions; <=0 disables",
+    )
+    parser.add_argument(
+        "--descent-margin",
+        type=float,
+        default=DESCENT_MARGIN,
+        help="TCP drop below the hover (m) that starts the descent (VLA hand-back detector)",
+    )
+    parser.add_argument(
+        "--ascent-margin",
+        type=float,
+        default=ASCENT_MARGIN,
+        help="TCP rise above the bottom (m) that fires the VLA hand-back",
+    )
     args = parser.parse_args()
 
     if args.target is not None and args.target_drop_zone:
@@ -473,6 +511,34 @@ def main() -> None:
     clip_warned: set[str] = set()
     rng = np.random.default_rng()
 
+    # Optional VLA: when a checkpoint is given, a SmolVLA policy drives the
+    # descend->grasp->lift segment in place of the classical PBVS descent. The
+    # policy speaks the raw follower frame (no offsets), so it loads once here and
+    # is passed to every execute_episode call. Recording is disabled in this mode.
+    policy_bundle = None
+    vla_device = None
+    if args.vla_checkpoint is not None:
+        from pick_and_place.image_rectify import SQUARE_SIZE
+        from pick_and_place.vla import make_policy, select_device
+
+        vla_device = select_device(args.vla_device)
+        print(f"Loading VLA {args.vla_checkpoint} on {vla_device} (first run downloads weights)...")
+        hw = (SQUARE_SIZE, SQUARE_SIZE)
+        policy_bundle = make_policy(args.vla_checkpoint, hw, hw, vla_device)
+        print(f"VLA descent active. Instruction: {args.vla_instruction!r}")
+
+    # Per-call VLA settings shared by every execute_episode pass. With
+    # policy_bundle=None these are inert and the classical PBVS descent runs.
+    vla_kwargs = dict(
+        policy_bundle=policy_bundle,
+        instruction=args.vla_instruction,
+        device=vla_device,
+        grasp_max_ticks=args.grasp_max_ticks,
+        grasp_max_joint_speed=args.grasp_max_joint_speed,
+        descent_margin=args.descent_margin,
+        ascent_margin=args.ascent_margin,
+    )
+
     print("Connecting to follower...")
     # Keep torque on a plain disconnect (crash / mid-loop exit) so the arm holds
     # rather than going limp; torque is only released deliberately at REST.
@@ -487,16 +553,20 @@ def main() -> None:
         if args.dataset_root is not None
         else Path(__file__).resolve().parents[2] / "datasets" / timestamp
     )
-    recording = RecordingSession(
-        repo_id=args.repo_id,
-        root=dataset_root,
-        task=args.task,
-        fps=CONTROL_HZ,
-        vcodec=args.vcodec,
-        streaming_encoding=args.streaming_encoding,
-        image_writer_threads=args.image_writer_threads,
-    )
-    print(f"Recording into LeRobotDataset at: {dataset_root}")
+    # The VLA segment loop logs no dataset frames, so recording is incompatible
+    # with VLA descent (the executor enforces this too).
+    recording = None
+    if policy_bundle is None:
+        recording = RecordingSession(
+            repo_id=args.repo_id,
+            root=dataset_root,
+            task=args.task,
+            fps=CONTROL_HZ,
+            vcodec=args.vcodec,
+            streaming_encoding=args.streaming_encoding,
+            image_writer_threads=args.image_writer_threads,
+        )
+        print(f"Recording into LeRobotDataset at: {dataset_root}")
 
     backend = cv2.CAP_AVFOUNDATION if hasattr(cv2, "CAP_AVFOUNDATION") else cv2.CAP_ANY
     print("Opening overhead camera...")
@@ -691,6 +761,7 @@ def main() -> None:
                     show_wrist_mixed=args.show_wrist_mixed,
                     failed_trajectory_dir=args.save_failed_trajectories,
                     free_grasp=True,
+                    **vla_kwargs,
                 )
                 if status == "restart":
                     raise EpisodeAborted
@@ -802,6 +873,7 @@ def main() -> None:
                             show_wrist_cam=args.show_wrist_cam,
                             show_wrist_mixed=args.show_wrist_mixed,
                             failed_trajectory_dir=args.save_failed_trajectories,
+                            **vla_kwargs,
                         )
 
                         if status == "restart":
@@ -821,7 +893,7 @@ def main() -> None:
                     move_to(REST_ARM_JOINTS, REST_GRIPPER, viewer)
                     ended_at_rest = True
     finally:
-        if recording.dataset is not None:
+        if recording is not None and recording.dataset is not None:
             print("Finalizing dataset...")
             recording.finalize()
             print(f"Dataset written to {dataset_root}")

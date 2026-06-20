@@ -47,9 +47,17 @@ from pick_and_place.follower import (
     real_frame_to_sim,
     sim_frame_to_real,
 )
-from pick_and_place.trajectory import replan_remaining_candidates
+from pick_and_place.grasp_segment import (
+    ASCENT_MARGIN,
+    DESCENT_MARGIN,
+    DescentAscentDetector,
+    run_grasp_segment,
+)
+from pick_and_place.image_rectify import SQUARE_SIZE, transform_frame
+from pick_and_place.trajectory import DescentPhase, replan_remaining_candidates
 from pick_and_place.kinematics import So101Kinematics
 from pick_and_place.recorder import EpisodeRecorder
+from pick_and_place.vla import DEFAULT_INSTRUCTION
 
 
 # Wall-clock rate shared by physical control, motor readback, camera indexing,
@@ -312,6 +320,129 @@ def _request_camera_fps(cap, label: str) -> None:
         )
 
 
+class _RealGraspEnv:
+    """Real-arm adapter implementing the ``grasp_segment.GraspEnv`` protocol.
+
+    Snapshots the latest wrist/overhead frames from the executor's reader
+    buffers and rectifies them to the square pinhole view the policy was trained
+    on, reports the follower readback verbatim as proprioceptive state, applies
+    velocity-capped and limit-clamped policy actions to the follower, and derives
+    the TCP height from forward kinematics on the measured joints. The MuJoCo
+    ``data`` is mirrored to each commanded pose so the viewer tracks the arm, but
+    the sim is never stepped: on a hardware run the real arm is the plant.
+    """
+
+    def __init__(
+        self,
+        follower,
+        snapshot_wrist,
+        snapshot_overhead,
+        kinematics: So101Kinematics,
+        offsets: np.ndarray,
+        clamp_low: np.ndarray,
+        clamp_high: np.ndarray,
+        clip_warned: set[str],
+        reference: np.ndarray,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        viewer,
+        image_size: int,
+        max_joint_speed: float,
+        control_hz: float,
+    ) -> None:
+        import cv2
+
+        from pick_and_place.camera_intrinsics import load_local_camera_intrinsics
+        from pick_and_place.image_rectify import build_undistort_map
+
+        self._cv2 = cv2
+        self._follower = follower
+        self._snapshot_wrist = snapshot_wrist
+        self._snapshot_overhead = snapshot_overhead
+        self._kinematics = kinematics
+        self._offsets = offsets
+        self._clamp_low = clamp_low
+        self._clamp_high = clamp_high
+        self._clip_warned = clip_warned
+        self._reference = np.asarray(reference, dtype=float)
+        self._model = model
+        self._data = data
+        self._viewer = viewer
+        self._image_size = image_size
+        self._max_step = max_joint_speed / control_hz if max_joint_speed > 0 else None
+
+        intrinsics = load_local_camera_intrinsics()
+        missing = [c for c in ("overhead_camera", "wrist_camera") if c not in intrinsics]
+        if missing:
+            raise RuntimeError(f"no calibrated intrinsics for {missing}; cannot undistort for the VLA")
+        wrist_bgr = snapshot_wrist()
+        overhead_bgr = snapshot_overhead()
+        if wrist_bgr is None or overhead_bgr is None:
+            raise RuntimeError("VLA grasp segment needs both camera streams running")
+        # Rectify maps depend only on the (fixed) frame resolution, so build them
+        # once from the first frames rather than per tick.
+        self._wrist_map = build_undistort_map(
+            intrinsics["wrist_camera"], wrist_bgr.shape[1], wrist_bgr.shape[0], cv2
+        )
+        self._overhead_map = build_undistort_map(
+            intrinsics["overhead_camera"], overhead_bgr.shape[1], overhead_bgr.shape[0], cv2
+        )
+        # Seeded so the first-tick velocity cap and the post-segment readback have
+        # a sane value before any action is applied.
+        self.last_commanded = self._reference.copy()
+        self._last_state = self._reference.copy()
+
+    def images(self) -> tuple[np.ndarray, np.ndarray]:
+        cv2 = self._cv2
+        wrist_rgb = transform_frame(
+            cv2.cvtColor(self._snapshot_wrist(), cv2.COLOR_BGR2RGB),
+            self._wrist_map,
+            self._image_size,
+            cv2,
+        )
+        overhead_rgb = transform_frame(
+            cv2.cvtColor(self._snapshot_overhead(), cv2.COLOR_BGR2RGB),
+            self._overhead_map,
+            self._image_size,
+            cv2,
+        )
+        return wrist_rgb, overhead_rgb
+
+    def observation_state(self) -> np.ndarray:
+        state = action_to_joints(self._follower.get_observation(), self._reference)
+        self._last_state = state
+        return state.astype(np.float32)
+
+    def tcp_z(self) -> float:
+        measured = action_to_joints(self._follower.get_observation(), self._reference)
+        arm_rad, _ = real_frame_to_sim(measured, self._offsets)
+        return float(self._kinematics.tip_position(arm_rad)[2])
+
+    def apply_action(self, action_real: np.ndarray) -> None:
+        target = clamp_and_warn(action_real, self._clamp_low, self._clamp_high, self._clip_warned)
+        commanded = target.copy()
+        # Velocity cap: an arm joint may move at most one tick's worth of travel
+        # beyond the measured pose, so a wild prediction can only ever crawl. The
+        # gripper passes through so open/close stays timely.
+        if self._max_step is not None:
+            arm_delta = target[:GRIPPER_INDEX] - self._last_state[:GRIPPER_INDEX]
+            commanded[:GRIPPER_INDEX] = self._last_state[:GRIPPER_INDEX] + np.clip(
+                arm_delta, -self._max_step, self._max_step
+            )
+        self._follower.send_action(joints_to_action(commanded))
+        self.last_commanded = commanded
+
+        # Mirror the commanded pose into the sim so the viewer tracks the arm.
+        # The sim is not stepped, so this is purely for visualization.
+        arm_rad, gripper_rad = real_frame_to_sim(commanded, self._offsets)
+        for name, value in arm_rad.items():
+            set_joint(self._model, self._data, name, value)
+        set_joint(self._model, self._data, "gripper", gripper_rad)
+        mujoco.mj_forward(self._model, self._data)
+        if self._viewer is not None:
+            self._viewer.sync()
+
+
 def execute_episode(
     episode: Episode,
     *,
@@ -327,6 +458,16 @@ def execute_episode(
     show_wrist_mixed: bool = False,
     failed_trajectory_dir: Path | str | None = None,
     free_grasp: bool = False,
+    policy_bundle: tuple | None = None,
+    instruction: str = DEFAULT_INSTRUCTION,
+    device=None,
+    grasp_control_hz: float = CONTROL_HZ,
+    grasp_max_ticks: int = 900,
+    descent_margin: float = DESCENT_MARGIN,
+    ascent_margin: float = ASCENT_MARGIN,
+    grasp_image_size: int = SQUARE_SIZE,
+    grasp_max_joint_speed: float = 10.0,
+    grasp_gripper_closed_max: float | None = None,
 ) -> str:
     """Run one pass of a prepared episode on an already-connected follower.
 
@@ -348,11 +489,24 @@ def execute_episode(
     completed episode is committed with ``save_episode``; a ``restart``/
     interrupted one is discarded with ``clear_episode_buffer``.
 
+    If ``policy_bundle`` (the ``make_policy`` triple) is given, the classical
+    closed-loop descent is replaced by a VLA: when the phase loop reaches the
+    ``DescentPhase`` a SmolVLA policy drives descend -> grasp -> lift closed-loop
+    on the real arm via ``grasp_segment.run_grasp_segment`` (object-agnostic
+    hand-back when the TCP descends then re-ascends), after which the classical
+    planner resumes from the measured post-lift state exactly as it does after a
+    classical lift. VLA mode needs both cameras open and is incompatible with
+    ``recording`` (the shared segment loop logs no dataset frames).
+
     Returns ``"success"`` when the trajectory ran to completion, or ``"restart"``
-    when a checkpoint replan failed and the caller should abort and re-home. A
-    ``KeyboardInterrupt`` propagates (after camera cleanup) so the caller can park.
-    Does not connect/disconnect the follower or move to REST — the caller does.
+    when a checkpoint replan failed or the VLA segment timed out and the caller
+    should abort and re-home. A ``KeyboardInterrupt`` propagates (after camera
+    cleanup) so the caller can park. Does not connect/disconnect the follower or
+    move to REST — the caller does.
     """
+    vla_mode = policy_bundle is not None
+    if vla_mode and recording is not None:
+        raise ValueError("VLA descent and dataset recording cannot be combined")
     model = episode.model
     data = episode.data
     kinematics = episode.kinematics
@@ -526,13 +680,14 @@ def execute_episode(
         print("Ramping real arm to the trajectory start pose...")
         ramp_to_start(follower, start_real, model, data, viewer)
 
-        # Recording starts only after the unrecorded ramp reaches the start pose.
-        # The wrist reader is already running from the open block above; the
-        # overhead reader is started here. Recording needs both cameras.
-        if recording is not None:
+        # The overhead reader starts only after the unrecorded ramp reaches the
+        # start pose. The wrist reader is already running from the open block
+        # above. Both recording and a VLA descent need the overhead view too.
+        need_overhead = recording is not None or vla_mode
+        if need_overhead:
             if wrist_cam is None or overhead_camera_cap is None or not overhead_camera_cap.isOpened():
                 raise RuntimeError(
-                    "Recording requires both the wrist and overhead cameras to be open"
+                    "Recording / VLA descent requires both the wrist and overhead cameras to be open"
                 )
             _request_camera_fps(overhead_camera_cap, "overhead")
             overhead_cam_running = True
@@ -540,7 +695,8 @@ def execute_episode(
             overhead_cam_thread.start()
 
             # Wait for both latest-frame buffers to fill so the first tick has a
-            # real frame to log and the dataset features get true frame shapes.
+            # real frame, the dataset features get true frame shapes, and the VLA
+            # env can size its rectify maps from the first frames.
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 with cam_lock:
@@ -553,6 +709,7 @@ def execute_episode(
             else:
                 raise RuntimeError("Timed out waiting for the episode camera streams to start")
 
+        if recording is not None:
             if recording.dataset is None:
                 recording.create_dataset(first_wrist.shape, first_overhead.shape)
             record_writer_thread = threading.Thread(target=record_writer, daemon=True)
@@ -573,15 +730,91 @@ def execute_episode(
             next_tick = time.monotonic()
 
             # Setup PBVS dynamically updating current source
-            from pick_and_place.trajectory import DescentPhase, _shortest_delta, grasp_candidates
+            from pick_and_place.trajectory import _shortest_delta, grasp_candidates
             from pick_and_place.geometry import CubePose, CUBE_HALF_SIZE
             from scipy.spatial.transform import Rotation
             import dataclasses
             import cv2
 
             is_descent = isinstance(phase, DescentPhase)
+            vla_descent = vla_mode and is_descent
 
-            while viewer.is_running():
+            if vla_descent:
+                # The VLA owns descend -> grasp -> lift. Run the shared segment
+                # closed-loop on the real arm, then resume the classical planner
+                # from the measured post-lift state exactly as a classical lift
+                # would. The hand-back is purely the TCP descent-then-ascent, so
+                # this never reads AprilTags or the cube model.
+                def _snapshot_wrist():
+                    with cam_lock:
+                        return cam_frame
+
+                def _snapshot_overhead():
+                    with overhead_lock:
+                        return overhead_frame
+
+                grasp_env = _RealGraspEnv(
+                    follower,
+                    _snapshot_wrist,
+                    _snapshot_overhead,
+                    kinematics,
+                    offsets,
+                    clamp_low,
+                    clamp_high,
+                    clip_warned,
+                    start_real,
+                    model,
+                    data,
+                    viewer,
+                    grasp_image_size,
+                    grasp_max_joint_speed,
+                    grasp_control_hz,
+                )
+                detector = DescentAscentDetector(
+                    descent_margin=descent_margin,
+                    ascent_margin=ascent_margin,
+                    gripper_closed_max=grasp_gripper_closed_max,
+                )
+                policy_bundle[0].reset()  # fresh action chunk for this grasp
+                print(f"Running VLA grasp segment (max {grasp_max_ticks} ticks)...")
+                result = run_grasp_segment(
+                    grasp_env,
+                    policy_bundle,
+                    instruction,
+                    detector,
+                    device,
+                    grasp_max_ticks,
+                    grasp_control_hz,
+                )
+                if not result.done:
+                    print(
+                        f"VLA grasp segment timed out after {result.ticks} ticks. "
+                        "Aborting episode."
+                    )
+                    _write_failed_trajectory_note(
+                        failed_trajectory_path,
+                        "VLA grasp segment timed out",
+                        source=dynamic_source,
+                        target=episode.target,
+                    )
+                    episode_status = "restart"
+                    return "restart"
+                print(f"VLA hand-back: descent-then-ascent after {result.ticks} ticks.")
+                completed_phase_name = "lift"
+                commanded = grasp_env.last_commanded
+                # The policy already descended, grasped, and lifted, so drop those
+                # classical phases; the replan below rebuilds carry/release/retreat
+                # from the measured post-lift state.
+                lift_index = next(
+                    i
+                    for i, p in enumerate(current_traj.phases)
+                    if p.name in ("lift", "recovery_lift")
+                )
+                current_traj = dataclasses.replace(
+                    current_traj, phases=current_traj.phases[lift_index + 1 :]
+                )
+
+            while not vla_descent and viewer.is_running():
                 phase_t = (data.time - playback_start) * speed
 
                 bgr = None
@@ -840,10 +1073,10 @@ def execute_episode(
                     # vision, I/O, or scheduling stall.
                     next_tick = time.monotonic()
 
-            if not viewer.is_running():
-                break
-
-            completed_phase_name = phase.name
+            if not vla_descent:
+                if not viewer.is_running():
+                    break
+                completed_phase_name = phase.name
 
             if completed_phase_name == "grasp":
                 gripper_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
