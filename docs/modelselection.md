@@ -179,7 +179,55 @@ Because ImageNet organizes its images using WordNet (a lexical database of Engli
 * **Keras/TensorFlow:** The `imagenet_class_index.json` file is standard for Keras pre-trained models and is officially hosted [here](https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json).
 * **Simplified Names:** If you just want a clean array of basic names without the Latin classifications (e.g., just "tench" instead of "tench, Tinca tinca"), the [imagenet-simple-labels](https://github.com/anishathalye/imagenet-simple-labels) repository on GitHub is widely used.
 
+- see appendix for a full list
 
+
+Here is a list of small, everyday household items that you might typically find lying on a table or desk, all of which are included in the official **1,000 ImageNet classes** (ILSVRC).
+
+The names below are shown as they appear in the official ImageNet class list:
+
+### **Electronics & Tech**
+
+* `cellular telephone, cellular phone, cellphone, cell, mobile phone`
+* `laptop, laptop computer`
+* `notebook, notebook computer`
+* `computer keyboard`
+* `mouse, computer mouse`
+* `remote control, remote`
+* `digital clock`
+* `digital watch`
+
+### **Desk & Office Supplies**
+
+* `rubber eraser, rubber, pencil eraser`
+* `pencil sharpener`
+* `rule, ruler`
+* `wallet, billfold, notecase, pocketbook`
+* `envelope`
+* `binder, ring-binder`
+
+### **Drinkware & Dining**
+
+* `coffee mug`
+* `saltshaker, salt shaker`
+* `water bottle`
+* `wine bottle`
+* `coffeepot`
+* `teapot`
+* `cup`
+
+### **Miscellaneous Personal Items**
+
+* `sunglasses, dark glasses, shades`
+* `lighter, light, igniter, ignitor`
+* `matchstick`
+* `pill bottle`
+* `hair spray`
+* `lotion`
+* `paper towel`
+
+
+# appendix 
 https://github.com/raghakot/keras-vis/blob/master/resources/imagenet_class_index.json
 
 ~~~
