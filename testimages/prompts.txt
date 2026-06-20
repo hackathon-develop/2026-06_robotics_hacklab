@@ -1,0 +1,9 @@
+you are generating an image for evaluating a computer vision task.
+the image is not distorted, more like from a medium quality robot camera images after postprocessing. the imges is noisy and grainy, has no saturated colors, is not optimally lighted.   
+resolution of the image is 512 by 512 pixel.
+
+the background is a table of light brown wood, like a massive stable table. the surface is in good shape, it has no to few light scratches and stains.   
+
+the image contains one pair of tweazers as object that is like 1/8 of the image width long. the object can be rotated arbitrarily. the perspective of the camera is from the top downwards with a very slight angle, like standing at the border of the observed area. there are no other things in the observed area. the observed area does not include the border of the table.
+
+
