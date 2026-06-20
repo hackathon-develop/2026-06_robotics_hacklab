@@ -5,10 +5,14 @@ Detects objects in an overhead camera feed and publishes the best match as a
 geometry_msgs/PoseStamped in the robot base frame, so a LeRobot arm can reach
 and pick the object.
 
-Pixel → robot XY transform uses a 3×3 homography matrix supplied via the
-`homography` parameter (9 floats, row-major).  Z is a fixed table-height
-parameter (`pick_z`).  Run camera–robot calibration once (e.g. with a
-checkerboard or point-click tool) and paste the resulting matrix as a parameter.
+Pixel → world XY transform uses calibrated camera intrinsics (K matrix +
+distortion coefficients loaded from overhead_camera.json) plus camera extrinsics
+(position and rotation in world frame, sourced from MuJoCo via cam_pos /
+cam_xmat parameters).  Each detected bounding-box centre is undistorted,
+back-projected into a ray in the camera frame, converted from OpenCV convention
+to MuJoCo convention (y and z flipped), rotated to world frame with cam_rot, and
+intersected with the table plane (z = pick_z) to give a metric (x, y) coordinate
+in the robot base frame.
 
 Topics published
 ----------------
@@ -23,14 +27,20 @@ camera_id       int     0                     OpenCV camera index when not using
 model           str     "yolo11m.pt"          detection model (see object_classification.py)
 confidence      float   0.25                  minimum detection confidence
 target_class    str     ""                    class name to pick; empty = highest-confidence object
-homography      list    identity (pixels)     9 floats for the 3×3 pixel→robot-XY homography
-pick_z          float   0.0                   fixed Z in robot base frame (table surface height)
-frame_id        str     "base_link"           robot base frame name
+intrinsics_path str     ""                    path to overhead_camera.json; empty = repo default
+                                              (config/camera_intrinsics/overhead_camera.json)
+cam_pos         list    [0.0, 0.0, 1.0]       camera position in world frame [x, y, z]
+                                              set from MuJoCo data.cam_xpos[camera_id]
+cam_xmat        list    identity              9 floats, row-major 3×3 camera rotation in world frame
+                                              set from MuJoCo data.cam_xmat[camera_id] (after mj_forward)
+pick_z          float   0.0                   table surface height in world frame (ray-plane intersection)
+frame_id        str     "base_link"           world / robot base frame name
 publish_hz      float   10.0                  max publish rate (frames are processed as fast as possible)
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -66,11 +76,75 @@ except ModuleNotFoundError:
 # Quaternion for gripper pointing straight down (180° around X in ROS convention).
 _GRIPPER_DOWN = Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
 
+# Default intrinsics JSON relative to the repo root (two levels above this file).
+_DEFAULT_INTRINSICS_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "config"
+    / "camera_intrinsics"
+    / "overhead_camera.json"
+)
 
-def _pixel_to_robot_xy(u: float, v: float, H: np.ndarray) -> tuple[float, float]:
-    """Apply a 3×3 homography to map pixel (u, v) → robot (x, y)."""
-    p = H @ np.array([u, v, 1.0])
-    return float(p[0] / p[2]), float(p[1] / p[2])
+
+def _load_intrinsics(path: Path) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Load K matrix, distortion coefficients, and calibration resolution from JSON.
+
+    Returns (K 3×3, dist 1-D, calib_width, calib_height).
+    """
+    data = json.loads(path.read_text())
+    K = np.array(data["camera_matrix"], dtype=float)
+    dist = np.array(data["dist_coeffs"], dtype=float)
+    return K, dist, int(data["width"]), int(data["height"])
+
+
+def _scale_K(K: np.ndarray, calib_w: int, calib_h: int, frame_w: int, frame_h: int) -> np.ndarray:
+    """Scale K from calibration resolution to actual frame resolution."""
+    if frame_w == calib_w and frame_h == calib_h:
+        return K
+    K = K.copy()
+    K[0, :] *= frame_w / calib_w  # fx, cx
+    K[1, :] *= frame_h / calib_h  # fy, cy
+    return K
+
+
+def _pixel_to_world_xy(
+    u: float,
+    v: float,
+    K: np.ndarray,
+    dist: np.ndarray,
+    cam_pos: np.ndarray,
+    cam_rot: np.ndarray,
+    pick_z: float,
+) -> tuple[float, float]:
+    """Back-project pixel (u, v) to world (x, y) at table height z = pick_z.
+
+    Pipeline (mirrors cube_detection.py / cube_pose_to_world):
+      1. cv2.undistortPoints removes lens distortion and divides by focal length
+         → normalised camera coordinates (x_n, y_n) with z_cv = 1.
+      2. Flip to MuJoCo camera convention (x right, y up, z backward):
+         ray_mj = [x_n, -y_n, -1].
+      3. Rotate ray to world frame: ray_world = cam_rot @ ray_mj.
+      4. Ray-plane intersection at z = pick_z:
+         t = (pick_z - cam_pos[2]) / ray_world[2]
+         (x, y) = cam_pos[:2] + t * ray_world[:2].
+    """
+    pts = np.array([[[u, v]]], dtype=np.float32)
+    # undistortPoints with no P returns normalised undistorted coords.
+    nd = cv2.undistortPoints(pts, K, dist)
+    x_n, y_n = float(nd[0, 0, 0]), float(nd[0, 0, 1])
+
+    # OpenCV ray [x_n, y_n, 1] → MuJoCo convention [x_n, -y_n, -1].
+    ray_mj = np.array([x_n, -y_n, -1.0])
+
+    # Rotate ray from MuJoCo camera frame to world frame.
+    ray_world = cam_rot @ ray_mj
+
+    if abs(ray_world[2]) < 1e-6:
+        raise ValueError(
+            f"Back-projected ray is parallel to the table plane for pixel ({u:.1f}, {v:.1f})."
+        )
+
+    t = (pick_z - cam_pos[2]) / ray_world[2]
+    return float(cam_pos[0] + t * ray_world[0]), float(cam_pos[1] + t * ray_world[1])
 
 
 def _collect_yolo_detections(
@@ -78,7 +152,7 @@ def _collect_yolo_detections(
     target_classes: list[str],
     class_name_lookup: list[str] | None,
 ) -> list[dict]:
-    """Return list of {label, confidence, cx, cy} from YOLO results."""
+    """Return list of {label, confidence, cx, cy, xyxy} from YOLO results."""
     detections = []
     for result in results:
         names = result.names
@@ -105,7 +179,7 @@ def _collect_rfdetr_detections(
     target_classes: list[str],
     class_name_lookup: list[str] | None,
 ) -> list[dict]:
-    """Return list of {label, confidence, cx, cy} from RF-DETR detections."""
+    """Return list of {label, confidence, cx, cy, xyxy} from RF-DETR detections."""
     detections = []
     class_names = detections_raw.data.get("class_name", [])
     for idx, (xyxy, conf, class_id) in enumerate(
@@ -135,10 +209,14 @@ class PickPoseNode(Node):
         self.declare_parameter("model", "yolo11m.pt")
         self.declare_parameter("confidence", 0.25)
         self.declare_parameter("target_class", "")
-        # Row-major 3×3 homography (pixel → robot XY).  Default = identity so
-        # outputs are raw pixel coordinates until the user calibrates.
+        self.declare_parameter("intrinsics_path", "")
+        # Camera position in world frame [x, y, z] — copy from MuJoCo
+        # data.cam_xpos[camera_id] after mj_forward.
+        self.declare_parameter("cam_pos", [0.0, 0.0, 1.0])
+        # Camera rotation matrix in world frame — 9 floats, row-major 3×3.
+        # Copy from MuJoCo data.cam_xmat[camera_id].flatten().tolist().
         self.declare_parameter(
-            "homography",
+            "cam_xmat",
             [1.0, 0.0, 0.0,
              0.0, 1.0, 0.0,
              0.0, 0.0, 1.0],
@@ -156,8 +234,29 @@ class PickPoseNode(Node):
         self._target_classes: list[str] = (
             [normalize_label(target_class_raw)] if target_class_raw.strip() else []
         )
-        h_flat: list[float] = self.get_parameter("homography").value
-        self._H: np.ndarray = np.array(h_flat, dtype=float).reshape(3, 3)
+
+        intrinsics_path_raw: str = self.get_parameter("intrinsics_path").value
+        intrinsics_path = (
+            Path(intrinsics_path_raw) if intrinsics_path_raw.strip() else _DEFAULT_INTRINSICS_PATH
+        )
+        if not intrinsics_path.is_file():
+            raise RuntimeError(
+                f"Camera intrinsics file not found: {intrinsics_path}\n"
+                "Set the 'intrinsics_path' parameter or place overhead_camera.json at "
+                "config/camera_intrinsics/overhead_camera.json."
+            )
+        self._K, self._dist, self._calib_w, self._calib_h = _load_intrinsics(intrinsics_path)
+        self.get_logger().info(f"Loaded camera intrinsics from '{intrinsics_path}'.")
+
+        # K scaled to the live frame resolution (set on first frame).
+        self._K_scaled: np.ndarray | None = None
+        self._frame_size: tuple[int, int] | None = None  # (width, height)
+
+        cam_pos_flat: list[float] = self.get_parameter("cam_pos").value
+        self._cam_pos: np.ndarray = np.array(cam_pos_flat, dtype=float)
+        cam_xmat_flat: list[float] = self.get_parameter("cam_xmat").value
+        self._cam_rot: np.ndarray = np.array(cam_xmat_flat, dtype=float).reshape(3, 3)
+
         self._pick_z: float = self.get_parameter("pick_z").value
         self._frame_id: str = self.get_parameter("frame_id").value
         publish_hz: float = self.get_parameter("publish_hz").value
@@ -186,7 +285,6 @@ class PickPoseNode(Node):
             self.create_subscription(Image, self._camera_topic, self._image_callback, 10)
             self.get_logger().info(f"Subscribing to camera topic '{self._camera_topic}'.")
         else:
-            # Open camera directly and drive with a timer.
             if cv2 is None:
                 raise RuntimeError("cv2 not found; install opencv-python.")
             self._cap = cv2.VideoCapture(self._camera_id)
@@ -204,7 +302,7 @@ class PickPoseNode(Node):
     # ------------------------------------------------------------------
 
     def _detect(self, pil_image: Any) -> list[dict]:
-        """Run model on a PIL Image; return sorted detections (best first)."""
+        """Run model on a PIL Image; return detections sorted best-first."""
         model_type, model, class_name_lookup = self._loaded_model
 
         if model_type == "rf-detr":
@@ -218,13 +316,24 @@ class PickPoseNode(Node):
         return dets
 
     def _publish_pick(self, best: dict, stamp: Any) -> None:
-        robot_x, robot_y = _pixel_to_robot_xy(best["cx"], best["cy"], self._H)
+        try:
+            world_x, world_y = _pixel_to_world_xy(
+                best["cx"], best["cy"],
+                self._K_scaled,
+                self._dist,
+                self._cam_pos,
+                self._cam_rot,
+                self._pick_z,
+            )
+        except ValueError as exc:
+            self.get_logger().warn(f"Skipping pick: {exc}")
+            return
 
         pose_msg = PoseStamped()
         pose_msg.header.stamp = stamp
         pose_msg.header.frame_id = self._frame_id
-        pose_msg.pose.position.x = robot_x
-        pose_msg.pose.position.y = robot_y
+        pose_msg.pose.position.x = world_x
+        pose_msg.pose.position.y = world_y
         pose_msg.pose.position.z = self._pick_z
         pose_msg.pose.orientation = _GRIPPER_DOWN
 
@@ -237,7 +346,7 @@ class PickPoseNode(Node):
         self.get_logger().info(
             f"Pick → label={best['label']} conf={best['confidence']:.2f} "
             f"pixel=({best['cx']:.1f}, {best['cy']:.1f}) "
-            f"robot=({robot_x:.4f}, {robot_y:.4f}, {self._pick_z:.4f})"
+            f"world=({world_x:.4f}, {world_y:.4f}, {self._pick_z:.4f})"
         )
 
     def _annotate_and_publish_image(self, frame: Any, detections: list[dict], stamp: Any) -> None:
@@ -260,6 +369,16 @@ class PickPoseNode(Node):
         if now - self._last_publish < self._min_interval:
             return
         self._last_publish = now
+
+        # Scale K to the live frame resolution on first frame (or if it changes).
+        frame_h, frame_w = frame.shape[:2]
+        if self._frame_size != (frame_w, frame_h):
+            self._frame_size = (frame_w, frame_h)
+            self._K_scaled = _scale_K(self._K, self._calib_w, self._calib_h, frame_w, frame_h)
+            self.get_logger().info(
+                f"Frame resolution {frame_w}×{frame_h} "
+                f"(calibration was {self._calib_w}×{self._calib_h}); K scaled."
+            )
 
         pil_image = camera_frame_to_image(frame)
         detections = self._detect(pil_image)
@@ -303,8 +422,6 @@ def main(args: list[str] | None = None) -> None:
     node = PickPoseNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
