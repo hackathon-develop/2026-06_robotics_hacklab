@@ -19,11 +19,11 @@ PAPER_SIZES = {
     "Letter": (215.9, 279.4),
 }
 
-# Robotics presets: (tag_size_mm, count, starting_id)
+# Robotics presets: (tag_size_mm, rect_size_mm, count, starting_id)
 PRESETS = {
-    "workspace_frame": (40.0, 4, 12),  # IDs 12-15 are standard for workspace_frame
-    "cube": (20.0, 6, 0),        # IDs 0-5 are standard for cubes
-    "drop_box": (60.0, 4, 8),    # IDs 8-11 are standard for drop boxes
+    "workspace_frame": (40.0, 60.0, 4, 12),  # IDs 12-15 are standard for workspace_frame
+    "cube": (20.0, 30.0, 6, 0),        # IDs 0-5 are standard for cubes
+    "drop_box": (60.0, 100.0, 4, 8),   # IDs 8-11 are standard for drop boxes
 }
 
 # Bit patterns for tagStandard41h12 (IDs 0-25) extracted from official AprilTag 3.
@@ -71,10 +71,10 @@ def get_tag_img(tag_id, size_px):
                 img[r*cell_size:(r+1)*cell_size, c*cell_size:(c+1)*cell_size] = 0
     return img
 
-def generate_tags(tag_ids, output_dir, tag_size_mm, margin_mm, paper_format):
+def generate_tags(tag_ids, output_dir, tag_size_mm, rect_size_mm, gap_mm, paper_format):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-        
+
     print(f"Generating {len(tag_ids)} tags (tagStandard41h12)...")
     
     tag_data = []
@@ -105,40 +105,45 @@ def generate_tags(tag_ids, output_dir, tag_size_mm, margin_mm, paper_format):
         
         tag_data.append({"id": tag_id, "raw": raw_path, "fancy": fancy_path})
 
-    create_pdf(tag_data, tag_size_mm, margin_mm, output_dir, paper_format)
+    create_pdf(tag_data, tag_size_mm, rect_size_mm, gap_mm, output_dir, paper_format)
 
-def create_pdf(tag_data, tag_size_mm, gap_mm, output_dir, paper_format):
+def create_pdf(tag_data, tag_size_mm, rect_size_mm, gap_mm, output_dir, paper_format):
     paper_w, paper_h = PAPER_SIZES.get(paper_format, PAPER_SIZES["A4"])
     page_margin = 15
     pdf = FPDF(orientation='P', unit='mm', format=paper_format)
     pdf.set_auto_page_break(False)
-    
-    item_w = tag_size_mm
-    item_h = tag_size_mm + 5
+
+    # The cut rectangle is the outer box; the tag is centred inside it.
+    box = max(rect_size_mm, tag_size_mm)
+    tag_offset = (box - tag_size_mm) / 2.0
+    item_w = box
+    item_h = box + 5  # leave room for the ID label below the cut line
     usable_w = paper_w - 2 * page_margin
-    usable_h = paper_h - 2 * page_margin - 10 
-    
+    usable_h = paper_h - 2 * page_margin - 10
+
     cols = max(1, int((usable_w + gap_mm) // (item_w + gap_mm)))
     rows = max(1, int((usable_h + gap_mm) // (item_h + gap_mm)))
     tags_per_page = cols * rows
-    
+
     for i, data in enumerate(tag_data):
         item_idx = i % tags_per_page
         if item_idx == 0:
             pdf.add_page()
             pdf.set_font("Helvetica", style='B', size=10)
-            pdf.text(page_margin, 12, f"AprilTag Standard 41h12 | Target Size: {tag_size_mm}mm")
+            pdf.text(page_margin, 12, f"AprilTag Standard 41h12 | Tag: {tag_size_mm}mm | Cut: {box}mm")
             pdf.set_font("Helvetica", size=8)
-            pdf.text(page_margin, 16, f"Print scale must be 100%. Black border: {tag_size_mm}mm.")
-            
+            pdf.text(page_margin, 16, "Print scale must be 100%. Cut along the rectangle outline.")
+
         col = item_idx % cols
         row = item_idx // cols
         x = page_margin + col * (item_w + gap_mm)
         y = page_margin + 15 + row * (item_h + gap_mm)
-        
-        pdf.image(data["raw"], x=x, y=y, w=tag_size_mm)
+
+        pdf.image(data["raw"], x=x + tag_offset, y=y + tag_offset, w=tag_size_mm)
+        pdf.set_line_width(0.2)
+        pdf.rect(x, y, box, box)
         pdf.set_font("Helvetica", size=7)
-        pdf.text(x, y + tag_size_mm + 3, f"ID: {data['id']}")
+        pdf.text(x, y + box + 3, f"ID: {data['id']}")
 
     filename = f"apriltags_41h12_{int(tag_size_mm)}mm_{paper_format}.pdf"
     pdf_path = os.path.join(output_dir, filename)
@@ -152,15 +157,20 @@ def main():
 
     parser.add_argument("--ids", type=int, nargs='+', help="Specific IDs to generate (0-25)")
     parser.add_argument("--tag_size_mm", type=float, default=40.0, help="Manual tag size in mm")
+    parser.add_argument("--rect_size_mm", type=float, default=None,
+                        help="Size of the cut rectangle in mm (defaults to 1.5x the tag size)")
     parser.add_argument("--output_dir", type=str, default="out/apriltags", help="Output directory")
     parser.add_argument("--paper", type=str, default="A4", choices=PAPER_SIZES.keys(), help="Paper format")
-    
+
     args = parser.parse_args()
-    
+
     tag_size = args.tag_size_mm
-    
+    rect_size = args.rect_size_mm
+
     if args.preset:
-        tag_size, count, start_id = PRESETS[args.preset]
+        tag_size, preset_rect, count, start_id = PRESETS[args.preset]
+        if rect_size is None:
+            rect_size = preset_rect
         tag_ids = list(range(start_id, start_id + count))
         print(f"Using preset '{args.preset}': {tag_size}mm tags, IDs {tag_ids}")
     elif args.ids:
@@ -170,7 +180,10 @@ def main():
         tag_ids = [12, 13, 14, 15]
         print("No IDs or preset specified. Defaulting to workspace_frame tags (12-15).")
 
-    generate_tags(tag_ids, args.output_dir, tag_size, 10.0, args.paper)
+    if rect_size is None:
+        rect_size = tag_size * 1.5
+
+    generate_tags(tag_ids, args.output_dir, tag_size, rect_size, 10.0, args.paper)
 
 if __name__ == "__main__":
     main()
