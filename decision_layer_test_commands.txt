@@ -1,0 +1,43 @@
+SPDX-FileCopyrightText: 2026 Mario Gemoll
+SPDX-License-Identifier: 0BSD
+
+Decision-layer test commands
+
+Live overhead camera:
+python py/scripts/view_multiarm_mixed.py --overhead-camera 0 --track-cube --track-drop-zone
+
+Live overhead camera with OpenCV CUDA:
+python py/scripts/view_multiarm_mixed.py --overhead-camera 0 --track-cube --track-drop-zone --opencv-cuda
+
+Static image:
+python py/scripts/view_multiarm_mixed.py --real-image image.png --track-cube --track-drop-zone
+
+Static image with OpenCV CUDA:
+python py/scripts/view_multiarm_mixed.py --real-image image.png --track-cube --track-drop-zone --opencv-cuda
+
+Custom two-arm placement:
+python py/scripts/view_multiarm_mixed.py --overhead-camera 0 --track-cube --track-drop-zone --arm arm1,0,-0.116,0 --arm arm2,0,0.116,0
+
+Custom two-arm placement with OpenCV CUDA:
+python py/scripts/view_multiarm_mixed.py --overhead-camera 0 --track-cube --track-drop-zone --opencv-cuda --arm arm1,0,-0.116,0 --arm arm2,0,0.116,0
+
+CUDA note:
+Pass --opencv-cuda only if Python cv2 was built with CUDA. The script falls back to CPU if CUDA is unavailable.
+
+Useful arguments:
+--overhead-camera INDEX_OR_PATH
+--real-image PATH
+--track-cube
+--track-drop-zone
+--arm name,x,y,yaw_deg
+--drop-zone-color black|white
+--intrinsics PATH
+--width INT
+--height INT
+--camera-width INT
+--camera-height INT
+--camera-fps INT
+--alpha FLOAT
+--cube-smooth FLOAT
+--drop-zone-smooth FLOAT
+--opencv-cuda
