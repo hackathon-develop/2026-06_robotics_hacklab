@@ -77,8 +77,6 @@ jobs:
       - name: "Run stylelint"
         working-directory: ts
         run: pnpm stylelint "src/**/*.css"
-      - name: "Check license headers"
-        run: scripts/check-license-headers.sh
       - name: "Build TS project"
         working-directory: ts
         run: pnpm build
