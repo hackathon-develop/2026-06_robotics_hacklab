@@ -11,5 +11,14 @@ venv/
 env/
 object_classification/venv/
 
+.idea
+
+
 __pycache__/
 *.py[cod]
+object_classification/.idea
+object_classification/.idea/misc.xml
+object_classification/.idea/modules.xml
+object_classification/.idea/object_classification.iml
+object_classification/.idea/vcs.xml
+object_classification/.idea/inspectionProfiles/profiles_settings.xml
