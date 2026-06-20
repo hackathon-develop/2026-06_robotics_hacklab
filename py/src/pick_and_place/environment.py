@@ -23,10 +23,17 @@ OVERHEAD_MOUNT_STL_DIR = (
     / "stl"
 )
 
-WORKSPACE_FRAME_POS = (0.279579, 0.0000305, 0.0)
+# The world is rooted at the workspace-frame (table) centre. ``TABLE_CENTER`` is
+# where that centre sat in the legacy robot-origin world; the whole scene is
+# re-expressed by translating it to the origin (world axes unchanged, still
+# aligned with the robots' forward(+x)/lateral(+y)). The frame body therefore
+# sits at the origin and the overhead-camera mount is shifted by -TABLE_CENTER.
+TABLE_CENTER = (0.279579, 0.0000305, 0.0)
+
+WORKSPACE_FRAME_POS = (0.0, 0.0, 0.0)
 WORKSPACE_FRAME_QUAT = (-0.707107, 0.0, 0.0, -0.707107)
 
-OVERHEAD_CAMERA_MOUNT_POS = (0.316979, -0.0729945, 0.0)
+OVERHEAD_CAMERA_MOUNT_POS = (0.037400, -0.073025, 0.0)
 OVERHEAD_CAMERA_MOUNT_QUAT = (-0.707107, 0.0, 0.0, -0.707107)
 
 WORKSPACE_FRAME_RED = (0.91, 0.3, 0.24, 1.0)
@@ -86,25 +93,6 @@ def _add_robot_arm_base(
     )
 
 
-def _add_north_single_robot_plate(
-    spec: mujoco.MjSpec,
-    frame: mujoco.MjsBody,
-    collision_default: mujoco.MjsDefault | None,
-) -> None:
-    """One robot arm-base plate at the north centre, flanked by grey plastic strips."""
-    _add_workspace_frame_part(
-        spec, frame, "north_02", WORKSPACE_FRAME_STL_DIR / "part_02_box_11p6.stl",
-        pos=(-0.1375, 0.2813, 0), rgba=WORKSPACE_FRAME_GRAY, material="plastic",
-        col_size=(0.053, 0.0187, 0.0036), col_pos=(-0.1325, 0.2813, 0.0036), collision_default=collision_default
-    )
-    _add_robot_arm_base(spec, frame, "north_03", cx=0.0, collision_default=collision_default)
-    _add_workspace_frame_part(
-        spec, frame, "north_04", WORKSPACE_FRAME_STL_DIR / "part_02_box_11p6.stl",
-        pos=(0.1375, 0.2813, 0), quat=(0, 0, 0, 1), rgba=WORKSPACE_FRAME_GRAY, material="plastic",
-        col_size=(0.053, 0.0187, 0.0036), col_pos=(0.1325, 0.2813, 0.0036), collision_default=collision_default
-    )
-
-
 def _add_north_dual_robot_plates(
     spec: mujoco.MjSpec,
     frame: mujoco.MjsBody,
@@ -125,27 +113,21 @@ def add_workspace_frame(
     spec: mujoco.MjSpec,
     *,
     collision_default: mujoco.MjsDefault | None = None,
-    dual_robot: bool = False,
 ) -> mujoco.MjsBody:
     """Add the 60cm calibration workspace_frame to the worldbody.
 
-    With ``dual_robot`` the single centre arm-base plate on the north edge is
-    replaced by two arm-base plates at local x = ±0.116 (the two robot mounts),
-    matching the two-robot hackathon rig.
+    The north edge carries two arm-base plates at local x = ±0.116, one per robot.
     """
     frame = spec.worldbody.add_body(name="workspace_frame_frame", pos=WORKSPACE_FRAME_POS, quat=WORKSPACE_FRAME_QUAT)
 
-    # North side components. The corner flats (north_01/north_05) are shared; the
-    # centre carries either one robot arm-base plate or two, depending on the rig.
+    # North side components. The corner flats (north_01/north_05) flank the two
+    # robot arm-base plates.
     _add_workspace_frame_part(
         spec, frame, "north_01", WORKSPACE_FRAME_STL_DIR / "part_01_box_10p45_flat.stl",
         pos=(-0.24775, 0.2813, 0), rgba=WORKSPACE_FRAME_RED, material="mdf",
         col_size=(0.05225, 0.0187, 0.0036), collision_default=collision_default
     )
-    if dual_robot:
-        _add_north_dual_robot_plates(spec, frame, collision_default)
-    else:
-        _add_north_single_robot_plate(spec, frame, collision_default)
+    _add_north_dual_robot_plates(spec, frame, collision_default)
     _add_workspace_frame_part(
         spec, frame, "north_05", WORKSPACE_FRAME_STL_DIR / "part_01_box_10p45_flat.stl",
         pos=(0.24775, 0.2813, 0), quat=(0, 0, 0, 1), rgba=WORKSPACE_FRAME_RED, material="mdf",

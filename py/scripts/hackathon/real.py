@@ -355,13 +355,6 @@ def main() -> None:
     parser.add_argument("--follower-port", required=True, help="serial port of the SO-101 follower")
     parser.add_argument("--follower-id", default="folly", help="follower calibration id (default: folly)")
     parser.add_argument(
-        "--robot",
-        choices=("left", "right"),
-        default="left",
-        help="which north plate carries the controlled robot (default: left); "
-        "the other plate holds the passive robot",
-    )
-    parser.add_argument(
         "--second-port",
         default=None,
         help="serial port of the passive SO-101; its joint angles are read and "
@@ -482,7 +475,6 @@ def main() -> None:
         dummy_source,
         include_environment=args.environment,
         paper_target_marker=args.target_drop_zone or args.show_drop_zone,
-        robot_side=args.robot,
     )
     model.opt.timestep = 1.0 / HARDWARE_SIMULATION_HZ
     apply_camera_extrinsics_to_model(model, load_local_camera_extrinsics())

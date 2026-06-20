@@ -20,10 +20,11 @@ from pick_and_place.geometry import CUBE_HALF_SIZE
 
 WORKSPACE_FRAME_INNER_HALF_EXTENT = 0.2813 - 0.0187
 
-# These values are pinned from ts/src/visualizations/workspace-overlay.ts and
-# ts/src/ik/workspace.ts for the stock SO-101 model. Recompute them when the
-# robot kinematics or the TypeScript workspace definitions change.
-PAN_AXIS = (0.0388353, -8.97657e-09)
+# World (x, y) of the controlled arm's shoulder-pan axis. The arm sits on the +y
+# north plate in the table-centred world, so this is the stock pan-axis offset
+# (0.0388353, ~0) shifted onto that base. Recompute when the robot kinematics or
+# the base placement change.
+PAN_AXIS = (-0.2407437, 0.1159999910234)
 AZIMUTH_MIN = -1.9198621771937634
 AZIMUTH_MAX = AZIMUTH_MIN + 3.839724354387525
 _PAN_AXIS = PAN_AXIS

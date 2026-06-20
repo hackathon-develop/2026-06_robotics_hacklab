@@ -17,7 +17,8 @@ def test_scene_contains_robot_floor_light_and_cube():
 
     assert model.body("base").id >= 0
     assert model.body("pick_cube").id >= 0
-    assert model.nbody == build_scene(wrist_camera=False).compile().nbody + 2
+    # Both robots carry a wrist camera, each adding two bodies.
+    assert model.nbody == build_scene(wrist_camera=False).compile().nbody + 4
     floor = model.geom("floor").id
     assert model.geom_type[floor] == mujoco.mjtGeom.mjGEOM_PLANE
     assert tuple(model.geom_size[floor, :2]) == (0.0, 0.0)

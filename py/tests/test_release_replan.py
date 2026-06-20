@@ -34,8 +34,8 @@ def test_release_lifts_from_locked_predrop_before_using_readback():
 
 
 def test_replan_after_release_retreats_from_elevated_readback():
-    source = CubePose(x=0.20, y=-0.12, z=CUBE_HALF_SIZE)
-    target = CubePose(x=0.20, y=-0.05, z=CUBE_HALF_SIZE)
+    source = CubePose(x=-0.079579, y=-0.004, z=CUBE_HALF_SIZE)
+    target = CubePose(x=-0.079579, y=0.066, z=CUBE_HALF_SIZE)
     model, _ = _build_model(source)
     kinematics = derive_kinematics(model)
     measured = {name: value + 0.05 for name, value in NEUTRAL_ARM_JOINTS.items()}

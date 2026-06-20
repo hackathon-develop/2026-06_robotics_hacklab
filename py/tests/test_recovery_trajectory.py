@@ -10,14 +10,14 @@ from pick_and_place.trajectory import RECOVERY_DROP_CUBE_CENTER_Z, RECOVERY_LIFT
 
 def test_free_grasp_recovery_lifts_vertically_before_carry():
     source = CubePose(
-        x=0.2652089160166924,
-        y=0.0743065789637258,
+        x=-0.0143700839833076,
+        y=0.1903065789637258,
         z=CUBE_HALF_SIZE,
         yaw=1.4937383406595242,
     )
     target = CubePose(
-        x=0.32446189743377685,
-        y=-0.11795889453162557,
+        x=0.04488289743377685,
+        y=-0.0019588945316255696,
         z=CUBE_HALF_SIZE,
         yaw=-1.8509609891758714,
     )

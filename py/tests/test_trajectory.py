@@ -25,8 +25,8 @@ def _drop_gripper_z(carry: object) -> np.ndarray:
 
 
 def test_vertical_zone_prefers_near_vertical_drops():
-    source = CubePose(x=0.20, y=-0.12, z=CUBE_HALF_SIZE)
-    target = CubePose(x=0.20, y=-0.05, z=CUBE_HALF_SIZE)
+    source = CubePose(x=-0.079579, y=-0.004, z=CUBE_HALF_SIZE)
+    target = CubePose(x=-0.079579, y=0.066, z=CUBE_HALF_SIZE)
     model, _ = _build_model(source)
     kinematics = derive_kinematics(model)
     grasp = next(grasp_candidates(kinematics, source))
@@ -43,8 +43,8 @@ def test_vertical_zone_prefers_near_vertical_drops():
 
 
 def test_fixed_target_must_be_in_allowed_drop_zone():
-    source = CubePose(x=0.20, y=-0.12, z=CUBE_HALF_SIZE)
-    target_on_apriltag_exclusion = CubePose(x=0.10, y=0.20, z=CUBE_HALF_SIZE)
+    source = CubePose(x=-0.079579, y=-0.004, z=CUBE_HALF_SIZE)
+    target_on_apriltag_exclusion = CubePose(x=-0.179579, y=0.316, z=CUBE_HALF_SIZE)
 
     with pytest.raises(EpisodeSamplingError, match="outside the allowed drop zone"):
         prepare_episode(
@@ -56,8 +56,8 @@ def test_fixed_target_must_be_in_allowed_drop_zone():
 
 
 def test_target_sampler_is_retried_across_attempt_budget(monkeypatch):
-    source = CubePose(x=0.20, y=-0.12, z=CUBE_HALF_SIZE)
-    target = CubePose(x=0.20, y=-0.05, z=CUBE_HALF_SIZE)
+    source = CubePose(x=-0.079579, y=-0.004, z=CUBE_HALF_SIZE)
+    target = CubePose(x=-0.079579, y=0.066, z=CUBE_HALF_SIZE)
     sampled_targets = []
 
     def target_sampler(_rng):
