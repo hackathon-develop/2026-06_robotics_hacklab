@@ -15,6 +15,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import cv2
 import mujoco
@@ -23,7 +24,10 @@ import numpy as np
 from pick_and_place.arm_config import ArmConfig, DEFAULT_TWO_ARM_CONFIGS, names_for_arm
 from pick_and_place.arm_workspace import arm_can_pick
 from pick_and_place.camera_compare import RealSource, draw_hud, draw_tag_detections, load_intrinsics
-from pick_and_place.camera_extrinsics import apply_camera_extrinsics_to_model, load_local_camera_extrinsics
+from pick_and_place.camera_extrinsics import (
+    apply_camera_extrinsics_to_model,
+    load_local_camera_extrinsics,
+)
 from pick_and_place.camera_intrinsics import LOCAL_CAMERA_INTRINSICS_DIR
 from pick_and_place.cam_align_solve import parse_index_or_path
 from pick_and_place.cube_detection import CUBE_TAG_IDS, CubePose, CubeTracker, detect_tags
@@ -44,6 +48,85 @@ from pick_and_place.workspace_overlays import (
 )
 
 WINDOW_TITLE = "view_multiarm_mixed  (m mode  , . alpha  q quit)"
+
+
+class OpenCvCuda:
+    """Small optional CUDA wrapper for OpenCV operations that support it."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = False
+        self._warned_remap = False
+        self._warned_edges = False
+        self._map_cache: dict[int, tuple[Any, Any]] = {}
+        if not enabled:
+            return
+        count = 0
+        cuda = getattr(cv2, "cuda", None)
+        if cuda is not None:
+            try:
+                count = cuda.getCudaEnabledDeviceCount()
+            except cv2.error:
+                count = 0
+        if count <= 0:
+            print(
+                "Warning: --opencv-cuda requested, but this OpenCV build has no CUDA "
+                "device; using CPU."
+            )
+            return
+        self.enabled = True
+        print(f"OpenCV CUDA enabled ({count} device{'s' if count != 1 else ''}).")
+
+    def remap(self, image: np.ndarray, maps: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+        if not self.enabled:
+            return cv2.remap(image, *maps, cv2.INTER_LINEAR)
+        try:
+            map1, map2 = self._gpu_maps(maps)
+            cuda = getattr(cv2, "cuda")
+            gpu_image = getattr(cv2, "cuda_GpuMat")()
+            gpu_image.upload(image)
+            return cuda.remap(gpu_image, map1, map2, cv2.INTER_LINEAR).download()
+        except (AttributeError, cv2.error) as exc:
+            if not self._warned_remap:
+                print(f"Warning: OpenCV CUDA remap failed; using CPU remap. {exc}")
+                self._warned_remap = True
+            return cv2.remap(image, *maps, cv2.INTER_LINEAR)
+
+    def edge_overlay(self, sim_rgb: np.ndarray, frame_rgb: np.ndarray) -> np.ndarray:
+        if self.enabled:
+            try:
+                cuda = getattr(cv2, "cuda")
+                gpu_sim = getattr(cv2, "cuda_GpuMat")()
+                gpu_sim.upload(sim_rgb)
+                gpu_gray = cuda.cvtColor(gpu_sim, cv2.COLOR_RGB2GRAY)
+                detector = cuda.createCannyEdgeDetector(60, 160)
+                edges = detector.detect(gpu_gray).download()
+                out = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                out[edges > 0] = (0, 255, 0)
+                return out
+            except (AttributeError, cv2.error) as exc:
+                if not self._warned_edges:
+                    print(f"Warning: OpenCV CUDA Canny failed; using CPU Canny. {exc}")
+                    self._warned_edges = True
+        gray = cv2.cvtColor(sim_rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 60, 160)
+        out = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        out[edges > 0] = (0, 255, 0)
+        return out
+
+    def _gpu_maps(self, maps: tuple[np.ndarray, np.ndarray]) -> tuple[Any, Any]:
+        key = id(maps[0])
+        cached = self._map_cache.get(key)
+        if cached is not None:
+            return cached
+        xmap, ymap = cv2.convertMaps(maps[0], maps[1], cv2.CV_32FC1)
+        gpu_mat = getattr(cv2, "cuda_GpuMat")
+        gpu_x = gpu_mat()
+        gpu_y = gpu_mat()
+        gpu_x.upload(xmap)
+        gpu_y.upload(ymap)
+        cached = (gpu_x, gpu_y)
+        self._map_cache[key] = cached
+        return cached
 
 
 @dataclass(frozen=True)
@@ -155,18 +238,34 @@ def _drop_debug(arm: ArmRuntime, target: PaperTarget | None) -> ReachDebug:
     )
 
 
-def _yes_no(value: bool | None) -> str:
-    if value is None:
-        return "n/a"
-    return "yes" if value else "no"
-
-
 def _distance_text(distance: float | None) -> str:
     return "n/a" if distance is None else f"{distance:.3f}m"
 
 
-def _radius_band_text(reach: ReachDebug) -> str:
-    return f"[{reach.inner_radius:.3f},{reach.outer_radius:.3f}]m"
+def _pick_state(reach: ReachDebug, can_pick: bool) -> str:
+    if can_pick:
+        return "ok"
+    if reach.distance is None:
+        return "no-obj"
+    if not reach.radius_ok:
+        return "range"
+    if not reach.pan_ok:
+        return "pan"
+    if reach.ik_ok is False:
+        return "ik"
+    return "no"
+
+
+def _drop_state(reach: ReachDebug, can_drop: bool) -> str:
+    if can_drop:
+        return "ok"
+    if reach.distance is None:
+        return "no-target"
+    if not reach.radius_ok:
+        return "range"
+    if not reach.pan_ok:
+        return "pan"
+    return "no"
 
 
 def _choose_arm(
@@ -192,17 +291,10 @@ def _choose_arm(
             candidates.append((score, arm.config.name))
 
         score_text = "n/a" if score is None else f"{score:.3f}m"
+        pick_text = f"pick={_pick_state(pick, can_pick)} d={_distance_text(pick.distance)}"
+        drop_text = f"drop={_drop_state(drop, can_drop)} d={_distance_text(drop.distance)}"
         statuses.append(
-            f"{arm.config.name}: pick={_yes_no(can_pick)} "
-            f"obj_d={_distance_text(pick.distance)} "
-            f"reach={_radius_band_text(pick)} r={_yes_no(pick.radius_ok)} "
-            f"pan={_yes_no(pick.pan_ok)} ik={_yes_no(pick.ik_ok)}"
-        )
-        statuses.append(
-            f"{arm.config.name}: drop={_yes_no(can_drop)} "
-            f"target_d={_distance_text(drop.distance)} "
-            f"reach={_radius_band_text(drop)} r={_yes_no(drop.radius_ok)} "
-            f"pan={_yes_no(drop.pan_ok)} score={score_text}"
+            f"{arm.config.name}: {pick_text}  {drop_text}  score={score_text}"
         )
 
     selected = min(candidates)[1] if candidates else None
@@ -219,7 +311,16 @@ def _put_lines(bgr: np.ndarray, lines: list[str], *, y0: int = 32) -> None:
     for index, line in enumerate(lines):
         y = y0 + index * 24
         cv2.putText(bgr, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(bgr, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            bgr,
+            line,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def main() -> None:
@@ -240,6 +341,11 @@ def main() -> None:
     parser.add_argument("--drop-zone-color", choices=["black", "white"], default="black")
     parser.add_argument("--cube-smooth", type=float, default=0.3)
     parser.add_argument("--drop-zone-smooth", type=float, default=0.3)
+    parser.add_argument(
+        "--opencv-cuda",
+        action="store_true",
+        help="use OpenCV CUDA for supported image operations, with CPU fallback",
+    )
     args = parser.parse_args()
 
     arms = tuple(args.arm) if args.arm else DEFAULT_TWO_ARM_CONFIGS
@@ -266,23 +372,44 @@ def main() -> None:
 
     undistort_map = None
     if intrinsics is not None:
-        rect_matrix, undistort_map = load_intrinsics(intrinsics, args.width, args.height, cv2)
+        rect_matrix, undistort_map = load_intrinsics(
+            intrinsics, args.width, args.height, cv2
+        )
         rect_fy = float(rect_matrix[1, 1])
-        model.cam_fovy[camera_id] = float(np.degrees(2.0 * np.arctan((args.height / 2.0) / rect_fy)))
+        model.cam_fovy[camera_id] = float(
+            np.degrees(2.0 * np.arctan((args.height / 2.0) / rect_fy))
+        )
     else:
-        focal = (args.height / 2.0) / np.tan(np.radians(model.cam_fovy[camera_id]) / 2.0)
-        rect_matrix = np.array([[focal, 0, args.width / 2.0], [0, focal, args.height / 2.0], [0, 0, 1]], dtype=float)
+        focal = (args.height / 2.0) / np.tan(
+            np.radians(model.cam_fovy[camera_id]) / 2.0
+        )
+        rect_matrix = np.array(
+            [[focal, 0, args.width / 2.0], [0, focal, args.height / 2.0], [0, 0, 1]],
+            dtype=float,
+        )
 
     detection_size = (args.camera_width, args.camera_height)
     detection_matrix, detection_map = rect_matrix, undistort_map
     if intrinsics is not None:
         detection_matrix, detection_map = load_intrinsics(intrinsics, *detection_size, cv2)
 
-    runtimes = [ArmRuntime(config=arm, kinematics=derive_kinematics(model, names_for_arm(arm.name))) for arm in arms]
+    cv_cuda = OpenCvCuda(args.opencv_cuda)
+
+    runtimes = [
+        ArmRuntime(
+            config=arm,
+            kinematics=derive_kinematics(model, names_for_arm(arm.name)),
+        )
+        for arm in arms
+    ]
     renderer = mujoco.Renderer(model, width=args.width, height=args.height)
     real = RealSource(
         image_path=args.real_image,
-        camera=parse_index_or_path(args.overhead_camera) if args.overhead_camera is not None else None,
+        camera=(
+            parse_index_or_path(args.overhead_camera)
+            if args.overhead_camera is not None
+            else None
+        ),
         width=args.camera_width,
         height=args.camera_height,
         fps=args.camera_fps,
@@ -300,7 +427,7 @@ def main() -> None:
             mujoco.mj_forward(model, data)
             frame = real.read(args.width, args.height)
             if undistort_map is not None:
-                frame = cv2.remap(frame, *undistort_map, cv2.INTER_LINEAR)
+                frame = cv_cuda.remap(frame, undistort_map)
 
             cube_pose = None
             drop_target = None
@@ -308,7 +435,7 @@ def main() -> None:
             if cube_tracker is not None or drop_tracker is not None:
                 det_rgb = real.read(*detection_size)
                 if detection_map is not None:
-                    det_rgb = cv2.remap(det_rgb, *detection_map, cv2.INTER_LINEAR)
+                    det_rgb = cv_cuda.remap(det_rgb, detection_map)
 
                 cam_pos = data.cam_xpos[camera_id]
                 cam_rot = data.cam_xmat[camera_id].reshape(3, 3)
@@ -326,22 +453,35 @@ def main() -> None:
                         set_paper_target_marker(model, data, drop_target, usable=True)
                 if cube_tracker is not None:
                     tag_detections = detect_tags(det_rgb, cube_tracker.detector)
-                    cube_detections = [det for det in tag_detections if det.tag_id in CUBE_TAG_IDS]
-                    cube_pose = cube_tracker.update(cube_detections, detection_matrix, cam_pos, cam_rot)
+                    cube_detections = [
+                        det for det in tag_detections if det.tag_id in CUBE_TAG_IDS
+                    ]
+                    cube_pose = cube_tracker.update(
+                        cube_detections, detection_matrix, cam_pos, cam_rot
+                    )
 
             renderer.update_scene(data, camera="overhead_camera")
             sim = renderer.render()
             if mode == "edges":
-                edges = cv2.Canny(cv2.cvtColor(sim, cv2.COLOR_RGB2GRAY), 60, 160)
-                out = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                out[edges > 0] = (0, 255, 0)
+                out = cv_cuda.edge_overlay(sim, frame)
             else:
-                out = cv2.cvtColor(cv2.addWeighted(frame, alpha, sim, 1.0 - alpha, 0.0), cv2.COLOR_RGB2BGR)
+                blended = cv2.addWeighted(frame, alpha, sim, 1.0 - alpha, 0.0)
+                out = cv2.cvtColor(blended, cv2.COLOR_RGB2BGR)
 
             if drop_target is not None:
-                draw_paper_target(out, drop_target, args.width / detection_size[0], args.height / detection_size[1])
+                draw_paper_target(
+                    out,
+                    drop_target,
+                    args.width / detection_size[0],
+                    args.height / detection_size[1],
+                )
             if tag_detections:
-                draw_tag_detections(out, tag_detections, args.width / detection_size[0], args.height / detection_size[1])
+                draw_tag_detections(
+                    out,
+                    tag_detections,
+                    args.width / detection_size[0],
+                    args.height / detection_size[1],
+                )
 
             selected, statuses = _choose_arm(runtimes, cube_pose, drop_target)
             object_position = None if cube_pose is None else cube_pose.position
@@ -349,8 +489,8 @@ def main() -> None:
             lines = [
                 _format_xyz("object", object_position),
                 _format_xyz("target", target_position),
-                "criterion: lowest score among arms with pick=yes and drop=yes",
-                "score: dist(arm pan axis, object) + dist(arm pan axis, target)",
+                "select: lowest score where pick=ok and drop=ok",
+                f"opencv: {'cuda' if cv_cuda.enabled else 'cpu'}",
                 f"selected: {selected or 'none'}",
                 *statuses,
             ]
