@@ -15,16 +15,11 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
+from pick_and_place.arm_config import ARM_JOINT_NAMES as _ARM_JOINT_NAMES, ArmNames
 from pick_and_place.geometry import GRIPPER_TARGET_POSITION
 from pick_and_place.transforms import Vec3
 
-ARM_JOINT_NAMES = (
-    "shoulder_pan",
-    "shoulder_lift",
-    "elbow_flex",
-    "wrist_flex",
-    "wrist_roll",
-)
+ARM_JOINT_NAMES = _ARM_JOINT_NAMES
 
 
 @dataclass(frozen=True)
@@ -99,15 +94,24 @@ def _joint_limit(model: mujoco.MjModel, name: str) -> JointLimit:
     return JointLimit(-np.inf, np.inf)
 
 
-def derive_kinematics(model: mujoco.MjModel) -> So101Kinematics:
+def derive_kinematics(
+    model: mujoco.MjModel,
+    names: ArmNames | None = None,
+) -> So101Kinematics:
+    """Derive kinematic constants for one arm in ``model``.
+
+    ``names`` defaults to the unprefixed single-arm model, preserving existing
+    callers. Multi-arm scenes pass ``ArmNames(prefix="arm1_")`` etc.
+    """
+    names = names or ArmNames()
     data = mujoco.MjData(model)
     data.qpos[:] = model.qpos0
     mujoco.mj_forward(model, data)
 
-    pan = _joint_frame(model, data, "shoulder_pan")
-    lift = _joint_frame(model, data, "shoulder_lift")
-    elbow = _joint_frame(model, data, "elbow_flex")
-    wrist_flex = _joint_frame(model, data, "wrist_flex")
+    pan = _joint_frame(model, data, names.shoulder_pan)
+    lift = _joint_frame(model, data, names.shoulder_lift)
+    elbow = _joint_frame(model, data, names.elbow_flex)
+    wrist_flex = _joint_frame(model, data, names.wrist_flex)
 
     pan_axis = pan.position.copy()
 
@@ -129,7 +133,7 @@ def derive_kinematics(model: mujoco.MjModel) -> So101Kinematics:
         dh = float(to[2] - frm[2])
         return PlanarSegment(radial=dr, height=dh, length=float(np.hypot(dr, dh)))
 
-    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, names.gripper)
     gripper_pos = data.xpos[gid].copy()
     gripper_rot = data.xmat[gid].reshape(3, 3)
     target = gripper_pos + gripper_rot @ GRIPPER_TARGET_POSITION
@@ -153,5 +157,5 @@ def derive_kinematics(model: mujoco.MjModel) -> So101Kinematics:
         lower_arm=segment(elbow.position, wrist_flex.position),
         tool_length=segment(wrist_flex.position, target).length,
         wrist_roll_zero_twist=wrist_roll_zero_twist,
-        joint_limits={name: _joint_limit(model, name) for name in ARM_JOINT_NAMES},
+        joint_limits={logical: _joint_limit(model, model_name) for logical, model_name in names.joints.items()},
     )
