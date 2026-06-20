@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Mario Gemoll
 # SPDX-License-Identifier: 0BSD
 
-"""Simple decision-making pipeline for multi-robot task assignment."""
+"""Decision-making pipeline for multi-robot task assignment."""
 
 from __future__ import annotations
 
@@ -37,6 +37,22 @@ def select_nearest_free_robot(
     return selected_id
 
 
+def can_robot_reach_cube(
+    robot: RobotState,
+    cube_pos: tuple[float, float, float],
+) -> bool:
+    """Return whether ``robot`` can reach the floor cube at ``cube_pos``.
+
+    Translates the cube into the robot's local frame (as if the robot sits at
+    world origin) before delegating to the workspace pickup-allowed check.
+    """
+    from pick_and_place.workspace_overlays import is_cube_pickup_allowed
+
+    cx, cy, _ = cube_pos
+    rx, ry, _ = robot["position"]
+    return is_cube_pickup_allowed(cx - rx, cy - ry)
+
+
 def robot_states_for_scene(
     reference_side: Literal["left", "right"] = "left",
     *,
@@ -70,18 +86,28 @@ def select_robot_for_cube(
     busy_ids: set[str] | None = None,
     reference_side: Literal["left", "right"] = "left",
 ) -> Literal["left", "right"] | None:
-    """Pick the nearest free robot side for a cube at ``cube_pos``.
+    """Pick the best free, reachable robot for a cube at ``cube_pos``.
 
-    ``busy_ids`` marks any robots currently executing a task. ``reference_side``
-    controls which robot the scene was built around (it sits at world origin).
-    Returns ``'left'`` or ``'right'``, or ``None`` if both are busy.
+    Pipeline:
+    1. Occupancy    – exclude robots in ``busy_ids``.
+    2. Reachability – exclude robots whose workspace does not cover the cube.
+    3. Distance     – choose the closest remaining robot.
+    4. Tie-break    – visual clarity / approach angle (not yet implemented).
+
+    Returns ``'left'`` or ``'right'``, or ``None`` if no candidate remains.
     """
     robots = robot_states_for_scene(reference_side)
     if busy_ids:
         for r in robots:
             if r["id"] in busy_ids:
                 r["status"] = "busy"
-    chosen = select_nearest_free_robot(robots, cube_pos)
-    if chosen is None:
+
+    free_robots = [r for r in robots if r["status"] == "free"]
+    reachable = [r for r in free_robots if can_robot_reach_cube(r, cube_pos)]
+
+    if not reachable:
         return None
+
+    # Step 4 (TODO): if distances are within threshold, apply visual-clarity tie-breaker.
+    chosen = select_nearest_free_robot(reachable, cube_pos)
     return chosen  # type: ignore[return-value]
