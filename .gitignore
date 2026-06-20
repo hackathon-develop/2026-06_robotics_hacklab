@@ -1,0 +1,15 @@
+*.pt
+*.pth
+*.onnx
+
+weights/
+.codex/
+.agents/
+
+.venv/
+venv/
+env/
+object_classification/venv/
+
+__pycache__/
+*.py[cod]
