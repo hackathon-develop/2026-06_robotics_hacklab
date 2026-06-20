@@ -1,0 +1,84 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MUJOCO_GL: egl
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: "Check for large files"
+        run: scripts/check_files_in_repo.sh
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v5
+      - name: "Install JS dependencies"
+        working-directory: ts
+        run: pnpm i
+      - name: "Install script dependencies"
+        working-directory: scripts
+        run: pnpm i
+      - name: "Install mesh generation system dependencies"
+        run: sudo apt-get update && sudo apt-get install -y libopengl0 libegl1-mesa-dev
+      - name: "Install simulation package dependencies"
+        working-directory: py
+        run: uv pip install --system -e . --group dev
+      - name: "Install mesh optimization package dependencies"
+        working-directory: mesh_optimization
+        run: uv pip install --system -e . --group dev
+      - name: "Generate AprilTag textures"
+        working-directory: py
+        run: python scripts/render_apriltag_textures.py --all-defaults
+      - name: "Run ruff on simulation package"
+        working-directory: py
+        run: python -m ruff check .
+      - name: "Run simulation package tests"
+        working-directory: py
+        run: python -m pytest
+      - name: "Generate web model"
+        working-directory: py
+        run: |
+          python -m pick_and_place.export -o ../ts/public/so101.xml
+          rm ../ts/public/so101.xml
+      - name: "Run ruff on mesh optimization package"
+        working-directory: mesh_optimization
+        run: python -m ruff check .
+      - name: "Generate meshes"
+        working-directory: mesh_optimization
+        run: python scripts/simplify_meshes.py
+      - name: "Optimize meshes"
+        working-directory: ts
+        run: pnpm run optimize-meshes
+      - name: "ESLint the ESLint config"
+        working-directory: ts
+        run: pnpm eslint -c basic.eslint.config.js basic.eslint.config.js eslint.config.js
+      - name: "ESLint"
+        working-directory: ts
+        run: pnpm eslint src
+      - name: "Run TS type checks"
+        working-directory: ts
+        run: pnpm run typecheck
+      - name: "Run TS tests"
+        working-directory: ts
+        run: pnpm test
+      - name: "Run stylelint"
+        working-directory: ts
+        run: pnpm stylelint "src/**/*.css"
+      - name: "Check license headers"
+        run: scripts/check-license-headers.sh
+      - name: "Build TS project"
+        working-directory: ts
+        run: pnpm build

@@ -1,24 +1,52 @@
+# Model weights / artifacts
 *.pt
 *.pth
 *.onnx
-
 weights/
+
+# Agent / tool dirs
 .codex/
 .agents/
 
+# Python envs
 .venv/
 venv/
 env/
 object_classification/venv/
 
+# Editors / IDE
 .idea
-
-
-__pycache__/
-*.py[cod]
 object_classification/.idea
 object_classification/.idea/misc.xml
 object_classification/.idea/modules.xml
 object_classification/.idea/object_classification.iml
 object_classification/.idea/vcs.xml
 object_classification/.idea/inspectionProfiles/profiles_settings.xml
+.vscode
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# OS / misc
+.DS_Store
+.python-version
+*.log
+*.bak
+
+# Claude / pnpm
+.claude
+.pnpm-store
+pnpm-lock.yaml
+
+# JS build artifacts
+node_modules
+dist
+build
+
+# Project-specific assets/config
+/assets/apriltags
+/dist_assets
+/intermediary-glb
+/config/camera_intrinsics/*.json
+/config/camera_extrinsics/*.json

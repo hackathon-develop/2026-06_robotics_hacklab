@@ -1,0 +1,8 @@
+.python-version
+__pycache__
+*.egg-info
+.venv/
+uv.lock
+datasets/
+out/
+records/

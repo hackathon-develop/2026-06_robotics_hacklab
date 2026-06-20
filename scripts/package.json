@@ -1,0 +1,13 @@
+{
+  "name": "pick-and-place-scripts",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check-license-headers": "pnpm run build && node dist/check-license-headers.js"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.2",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,130 @@
+# SPDX-FileCopyrightText: 2026 Mario Gemoll
+# SPDX-License-Identifier: 0BSD
+
+"""Cube, contact, and pregrasp transforms.
+
+The "simple pregrasp" pose keeps the gripper vertical (roll axis up, jaws closing
+horizontally onto a vertical cube face).
+
+Naming note: ``pregrasp`` here is the gripper pose *at* the cube (open, ready to
+close) and a raised ``pregrasp`` (positive ``z_offset``) is the "hover". In
+canonical grasp terminology the raised pose is the *pre-grasp / approach* pose
+and the at-cube pose is the *grasp* pose.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from pick_and_place import transforms as tf
+from pick_and_place.transforms import Mat4
+
+# Fixed-jaw tip collision box (the innermost box of the fixed-jaw model).
+_TIP_BOX_POS = np.array((-0.01189, -0.00015, -0.099363))
+_TIP_BOX_SIZE = np.array((0.004, 0.00545, 0.005063))
+
+CUBE_HALF_SIZE = 0.015
+SAFETY_MARGIN = 0.01
+_MARKER_SURFACE_OFFSET = 0.00001
+
+WORLD_UP = np.array((0.0, 0.0, 1.0))
+_VERTICAL_TOLERANCE = 1e-9
+
+# Jaw contact point: center of the tip box's inner face. The y component is
+# deliberately zeroed so it stays in the pan-axis plane (which the IK relies on).
+JAW_CONTACT_POSITION = np.array(
+    (_TIP_BOX_POS[0] + _TIP_BOX_SIZE[0] + _MARKER_SURFACE_OFFSET, 0.0, _TIP_BOX_POS[2])
+)
+
+# Jaw vertical offset from the vertical center of the cube (in meters).
+# A negative value shifts the grip lower on the cube (e.g., -0.005 grips 5mm lower).
+GRIP_Z_OFFSET = -0.005
+
+# Cube contact point: center of the +x face, nudged out by the marker offset,
+# and shifted vertically by GRIP_Z_OFFSET.
+CUBE_CONTACT_POSITION = np.array((CUBE_HALF_SIZE + _MARKER_SURFACE_OFFSET, 0.0, GRIP_Z_OFFSET))
+
+# IK position target: jaw contact projected onto the wrist-roll axis. The offset
+# from contact to here runs along gripper x, so wrist roll leaves it invariant.
+GRIPPER_TARGET_POSITION = np.array((0.0, 0.0, _TIP_BOX_POS[2]))
+
+CubeFace = str  # one of '+x', '-x', '+y', '-y', '+z', '-z'
+
+VERTICAL_FACES: tuple[CubeFace, ...] = ("+x", "-x", "+y", "-y")
+
+
+@dataclass(frozen=True)
+class CubePose:
+    x: float
+    y: float
+    z: float
+    roll: float = 0.0
+    pitch: float = 0.0
+    yaw: float = 0.0
+
+
+def world_from_cube(pose: CubePose) -> Mat4:
+    return tf.translation(pose.x, pose.y, pose.z) @ tf.rotation_zyx(
+        pose.roll, pose.pitch, pose.yaw
+    )
+
+
+def _cube_face_rotation(face: CubeFace) -> Mat4:
+    if face == "+x":
+        return tf.identity()
+    if face == "+y":
+        return tf.rot_z(-np.pi / 2)
+    if face == "-x":
+        return tf.rot_z(np.pi)
+    if face == "-y":
+        return tf.rot_z(np.pi / 2)
+    if face == "+z":
+        return tf.rot_y(np.pi / 2)
+    if face == "-z":
+        return tf.rot_y(-np.pi / 2)
+    raise ValueError(f"Unknown cube face: {face}")
+
+
+def _cube_from_contact() -> Mat4:
+    # Point the target frame into the cube so the surfaces are flush.
+    out = tf.rot_y(-np.pi / 2)
+    out[:3, 3] = CUBE_CONTACT_POSITION
+    return out
+
+
+def _gripper_from_contact() -> Mat4:
+    out = tf.rot_y(np.pi / 2)
+    out[:3, 3] = JAW_CONTACT_POSITION
+    return out
+
+
+def world_from_cube_contact(face: CubeFace, pose: CubePose) -> Mat4:
+    return world_from_cube(pose) @ _cube_face_rotation(face) @ _cube_from_contact()
+
+
+def simple_pregrasp_matrix(face: CubeFace, pose: CubePose) -> Mat4 | None:
+    """World-from-gripper for the vertical pregrasp on ``face``, or ``None`` when
+    the face is not vertical for this pose."""
+    world_from_contact = world_from_cube_contact(face, pose)
+    inward_normal = tf.transform_direction(world_from_contact, WORLD_UP)
+    if abs(float(np.dot(inward_normal, WORLD_UP))) > _VERTICAL_TOLERANCE:
+        return None
+
+    gripper_y = np.cross(WORLD_UP, inward_normal)
+    world_from_gripper = tf.make_basis(inward_normal, gripper_y, WORLD_UP)
+
+    cube_contact_position = tf.get_position(world_from_contact)
+    jaw_contact_position = cube_contact_position - inward_normal * SAFETY_MARGIN
+    jaw_offset = world_from_gripper[:3, :3] @ JAW_CONTACT_POSITION
+    return tf.with_position(world_from_gripper, jaw_contact_position - jaw_offset)
+
+
+def pregrasp_matrix(face: CubeFace, pose: CubePose, z_offset: float = 0.0) -> Mat4 | None:
+    """``simple_pregrasp_matrix`` shifted up along world z by ``z_offset``."""
+    pregrasp = simple_pregrasp_matrix(face, pose)
+    if pregrasp is None:
+        return None
+    pos = tf.get_position(pregrasp)
+    return tf.with_position(pregrasp, pos + np.array((0.0, 0.0, z_offset)))
