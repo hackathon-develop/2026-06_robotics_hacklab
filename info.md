@@ -2,10 +2,18 @@
 
 ## coordination channels
 
-- discord
+- group discord 
   - https://discord.gg/5VKjRCEQP 
-- miro
+
+- group miro
   - https://miro.com/app/board/uXjVHD6mU2s=/?share_link_id=387766827014
+
+
+- hack ressources notion
+  - https://app.notion.com/p/HackLab-Hackathon-Resources-37a6641d682f804b91a5c827eae44c77
+
+- hack discord
+  - https://discord.gg/Zv33F69Q
 
 ### pick and place base
 
