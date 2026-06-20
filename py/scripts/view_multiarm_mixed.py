@@ -272,15 +272,19 @@ def _choose_arm(
     arms: list[ArmRuntime],
     cube_pose: CubePose | None,
     target: PaperTarget | None,
-) -> tuple[str | None, list[str]]:
+) -> tuple[str | None, list[str], bool]:
     statuses = []
     candidates: list[tuple[float, str]] = []
+    drop_reachable = False
     for arm in arms:
         score: float | None = None
         pick = _pick_debug(arm, cube_pose)
         drop = _drop_debug(arm, target)
         can_pick = pick.rough_ok and bool(pick.ik_ok)
         can_drop = drop.rough_ok
+
+        if can_drop:
+            drop_reachable = True
 
         if can_pick and can_drop and cube_pose is not None and target is not None:
             pan_xy = arm.kinematics.pan_axis[:2]
@@ -298,7 +302,7 @@ def _choose_arm(
         )
 
     selected = min(candidates)[1] if candidates else None
-    return selected, statuses
+    return selected, statuses, drop_reachable
 
 
 def _format_xyz(label: str, value: np.ndarray | None) -> str:
@@ -389,9 +393,20 @@ def main() -> None:
         )
 
     detection_size = (args.camera_width, args.camera_height)
-    detection_matrix, detection_map = rect_matrix, undistort_map
     if intrinsics is not None:
         detection_matrix, detection_map = load_intrinsics(intrinsics, *detection_size, cv2)
+    else:
+        sx = args.camera_width / args.width
+        sy = args.camera_height / args.height
+        detection_matrix = np.array(
+            [
+                [rect_matrix[0, 0] * sx, 0, rect_matrix[0, 2] * sx],
+                [0, rect_matrix[1, 1] * sy, rect_matrix[1, 2] * sy],
+                [0, 0, 1],
+            ],
+            dtype=float,
+        )
+        detection_map = None
 
     cv_cuda = OpenCvCuda(args.opencv_cuda)
 
@@ -449,8 +464,6 @@ def main() -> None:
                         workspace_corners_world=workspace_corners,
                     )
                     drop_target = drop_tracker.update(raw_target)
-                    if drop_target is not None:
-                        set_paper_target_marker(model, data, drop_target, usable=True)
                 if cube_tracker is not None:
                     tag_detections = detect_tags(det_rgb, cube_tracker.detector)
                     cube_detections = [
@@ -483,7 +496,9 @@ def main() -> None:
                     args.height / detection_size[1],
                 )
 
-            selected, statuses = _choose_arm(runtimes, cube_pose, drop_target)
+            selected, statuses, drop_reachable = _choose_arm(runtimes, cube_pose, drop_target)
+            if drop_target is not None:
+                set_paper_target_marker(model, data, drop_target, usable=drop_reachable)
             object_position = None if cube_pose is None else cube_pose.position
             target_position = None if drop_target is None else drop_target.center_world
             lines = [
