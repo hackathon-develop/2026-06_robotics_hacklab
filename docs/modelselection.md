@@ -260,10 +260,42 @@ Here are the exact, human-readable class names for tools and hardware found in t
 
 *(Note: Items like wrenches, pliers, and tape measures are part of the broader, much larger ImageNet-21k dataset, but they did not make the cut for the famous 1,000-class subset used in most standard classification benchmarks.)*
 
+## imagenet 21k
 
+Because ImageNet-21k (often interchangeably referred to as ImageNet-22k) contains **21,841 classes**, the full list is much too long to display here. However, you can access the complete, human-readable class mappings through several open-source repositories on GitHub.
+
+Here are the most reliable links to raw text files and Gists containing the full ImageNet-21k/22k class list:
+
+### **1. Standard GitHub Gist Mapping**
+
+This is a popular, straightforward text file mapping the ImageNet WordNet ID (e.g., `n00004475`) directly to the human-readable class name.
+
+* **Link:** [ImageNet-21k Label with Classnames (Gist by BIGBALLON)](https://gist.github.com/BIGBALLON/63d153b966f64a7dbf7a06d7a28396c2)
+
+### **2. Microsoft FocalNet Repository**
+
+Microsoft provides a `labelmap_22k_reorder.txt` file in their FocalNet repository. This file contains the 21,841 labels reordered to make it easier to map directly to the standard 1,000 ImageNet classes for evaluation purposes.
+
+* **Link:** [FocalNet ImageNet-22k Label Map (Microsoft)](https://github.com/microsoft/FocalNet/blob/main/labelmap_22k_reorder.txt)
+
+### **3. Dedicated ImageNet-21k Repository**
+
+If you need the dataset splits and metadata alongside the class files, this community repository hosts the original text files that map the 21k categories.
+
+* **Link:** [ImageNet_21k_Original_OK Repository](https://github.com/mosjel/ImageNet_21k_Original_OK)
+
+*(Note: Depending on the specific pre-trained model you are using—like Swin Transformer, ViT, or ConvNeXt—the developers may have applied a slightly different internal sorting index. If you are coding, always verify against the `classes.txt` or `labelmap.txt` provided directly in the repository of the model you are deploying!)*
 
 
 # appendix 
+
+## imagenet 21k
+
+https://github.com/mosjel/ImageNet_21k_Original_OK/blob/main/imagenet_21k_original_OK.txt
+
+
+
+## imagenet 1k
 https://github.com/raghakot/keras-vis/blob/master/resources/imagenet_class_index.json
 
 ~~~
