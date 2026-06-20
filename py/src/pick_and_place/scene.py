@@ -18,7 +18,11 @@ from pick_and_place.environment import (
     add_workspace_frame_apriltags,
 )
 from pick_and_place.materials import MaterialConfig, apply_materials
-from pick_and_place.workspace_overlays import add_workspace_overlays
+from pick_and_place.workspace_overlays import (
+    add_cube_exclusion_overlays,
+    add_workspace_overlays,
+    pan_axis_for_base,
+)
 
 # Tag IDs stickered onto the pick cube's six faces, in MuJoCo cube-texture order
 # (right, left, up, down, front, back). With the cube unrotated those map to the
@@ -86,8 +90,17 @@ def build_scene(
     base = spec.body("base")
     base.pos = ROBOT_BASE_POSITIONS[0][1]
 
-    # Attach overlays to worldbody so they stay on the floor.
-    add_workspace_overlays(spec, spec.worldbody)
+    # Attach overlays to worldbody so they stay on the floor. Each robot draws
+    # its own reachable sectors at its pan axis; the AprilTag exclusion boxes are
+    # world-fixed and added once.
+    for prefix, base_pos in ROBOT_BASE_POSITIONS:
+        add_workspace_overlays(
+            spec,
+            spec.worldbody,
+            pan_axis=pan_axis_for_base((base_pos[0], base_pos[1])),
+            prefix=prefix,
+        )
+    add_cube_exclusion_overlays(spec, spec.worldbody)
     _add_pick_cube(spec, apriltag=apriltag_cube)
 
     if include_environment:

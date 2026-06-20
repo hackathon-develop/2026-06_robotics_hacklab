@@ -99,15 +99,23 @@ def _joint_limit(model: mujoco.MjModel, name: str) -> JointLimit:
     return JointLimit(-np.inf, np.inf)
 
 
-def derive_kinematics(model: mujoco.MjModel) -> So101Kinematics:
+def derive_kinematics(model: mujoco.MjModel, prefix: str = "") -> So101Kinematics:
+    """Derive the closed-form kinematics for the arm whose joints/bodies carry
+    ``prefix``.
+
+    The unprefixed (controlled) arm uses ``prefix=""``; an attached arm uses its
+    actuator-name prefix (e.g. ``"other_"``), so its world ``pan_axis`` is read at
+    its true base position. The returned ``joint_limits`` stay keyed by the bare
+    joint name so the prefix-agnostic IK/trajectory code is unaffected.
+    """
     data = mujoco.MjData(model)
     data.qpos[:] = model.qpos0
     mujoco.mj_forward(model, data)
 
-    pan = _joint_frame(model, data, "shoulder_pan")
-    lift = _joint_frame(model, data, "shoulder_lift")
-    elbow = _joint_frame(model, data, "elbow_flex")
-    wrist_flex = _joint_frame(model, data, "wrist_flex")
+    pan = _joint_frame(model, data, f"{prefix}shoulder_pan")
+    lift = _joint_frame(model, data, f"{prefix}shoulder_lift")
+    elbow = _joint_frame(model, data, f"{prefix}elbow_flex")
+    wrist_flex = _joint_frame(model, data, f"{prefix}wrist_flex")
 
     pan_axis = pan.position.copy()
 
@@ -129,7 +137,7 @@ def derive_kinematics(model: mujoco.MjModel) -> So101Kinematics:
         dh = float(to[2] - frm[2])
         return PlanarSegment(radial=dr, height=dh, length=float(np.hypot(dr, dh)))
 
-    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{prefix}gripper")
     gripper_pos = data.xpos[gid].copy()
     gripper_rot = data.xmat[gid].reshape(3, 3)
     target = gripper_pos + gripper_rot @ GRIPPER_TARGET_POSITION
@@ -153,5 +161,5 @@ def derive_kinematics(model: mujoco.MjModel) -> So101Kinematics:
         lower_arm=segment(elbow.position, wrist_flex.position),
         tool_length=segment(wrist_flex.position, target).length,
         wrist_roll_zero_twist=wrist_roll_zero_twist,
-        joint_limits={name: _joint_limit(model, name) for name in ARM_JOINT_NAMES},
+        joint_limits={name: _joint_limit(model, f"{prefix}{name}") for name in ARM_JOINT_NAMES},
     )

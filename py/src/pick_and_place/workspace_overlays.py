@@ -16,7 +16,7 @@ from pick_and_place.environment import (
     WORKSPACE_FRAME_POS,
     WORKSPACE_FRAME_QUAT,
 )
-from pick_and_place.geometry import CUBE_HALF_SIZE
+from pick_and_place.geometry import CUBE_HALF_SIZE, CubePose
 
 WORKSPACE_FRAME_INNER_HALF_EXTENT = 0.2813 - 0.0187
 
@@ -30,6 +30,16 @@ AZIMUTH_MAX = AZIMUTH_MIN + 3.839724354387525
 _PAN_AXIS = PAN_AXIS
 _AZIMUTH_MIN = AZIMUTH_MIN
 _AZIMUTH_LENGTH = AZIMUTH_MAX - AZIMUTH_MIN
+
+# Shoulder-pan axis offset relative to an (unrotated) robot base, read off the
+# stock SO-101 at its reference pose. A robot's world pan axis is its base XY
+# plus this offset; both arms face world +x, so they share the azimuth sector.
+PAN_AXIS_BASE_OFFSET = (0.0388353, -8.97657e-09)
+
+
+def pan_axis_for_base(base_xy: tuple[float, float]) -> tuple[float, float]:
+    """World (x, y) of the shoulder-pan axis for a robot based at ``base_xy``."""
+    return (base_xy[0] + PAN_AXIS_BASE_OFFSET[0], base_xy[1] + PAN_AXIS_BASE_OFFSET[1])
 
 WORKSPACE_OVERLAY_GROUP = 4
 _SEGMENTS = 96
@@ -87,13 +97,22 @@ CUBE_PLACEMENT_OVERLAY = WorkspaceOverlay(
 
 
 def _is_cube_center_allowed(
-    x: float, y: float, overlay: WorkspaceOverlay
+    x: float,
+    y: float,
+    overlay: WorkspaceOverlay,
+    pan_axis: tuple[float, float] = PAN_AXIS,
 ) -> bool:
+    """Whether a cube center is in ``overlay``'s reachable zone for one arm.
+
+    The annular-sector + azimuth test is taken relative to ``pan_axis`` (so it
+    recentres per arm), while the table placement rectangle and AprilTag-plate
+    exclusions are world-fixed and shared across all arms.
+    """
     x_min, x_max, y_min, y_max = CUBE_PLACEMENT_BOUNDS
     if not (x_min <= x <= x_max and y_min <= y <= y_max):
         return False
-    dx = x - PAN_AXIS[0]
-    dy = y - PAN_AXIS[1]
+    dx = x - pan_axis[0]
+    dy = y - pan_axis[1]
     radius = math.hypot(dx, dy)
     azimuth = math.atan2(dy, dx)
     in_clearance_sector = (
@@ -111,23 +130,73 @@ def _is_cube_center_allowed(
     )
 
 
-def is_cube_pickup_allowed(x: float, y: float) -> bool:
+def is_cube_pickup_allowed(
+    x: float, y: float, pan_axis: tuple[float, float] = PAN_AXIS
+) -> bool:
     """Return whether a floor cube can use the vertical pickup pose."""
-    return _is_cube_center_allowed(x, y, WORKSPACE_OVERLAYS[-1])
+    return _is_cube_center_allowed(x, y, WORKSPACE_OVERLAYS[-1], pan_axis)
 
 
-def is_vertical_grip_allowed(x: float, y: float) -> bool:
+def is_vertical_grip_allowed(
+    x: float, y: float, pan_axis: tuple[float, float] = PAN_AXIS
+) -> bool:
     """Return whether a floor cube can use the vertical gripper pose."""
-    return is_cube_pickup_allowed(x, y)
+    return is_cube_pickup_allowed(x, y, pan_axis)
 
 
-def is_cube_drop_allowed(x: float, y: float) -> bool:
+def is_cube_drop_allowed(
+    x: float, y: float, pan_axis: tuple[float, float] = PAN_AXIS
+) -> bool:
     """Return whether a cube-center drop target is in the broad arm workspace."""
-    return _is_cube_center_allowed(x, y, CUBE_PLACEMENT_OVERLAY)
+    return _is_cube_center_allowed(x, y, CUBE_PLACEMENT_OVERLAY, pan_axis)
 
 
 # Backward-compatible name for callers that mean pickup placement.
 is_cube_placement_allowed = is_cube_pickup_allowed
+
+
+def sample_handover_pose(
+    rng: np.random.Generator,
+    pan_drop: tuple[float, float],
+    pan_pick: tuple[float, float],
+    source: CubePose,
+    target: CubePose,
+    *,
+    bias_sigma: float = 0.06,
+    max_attempts: int = 20000,
+) -> CubePose:
+    """Sample a floor cube pose in the zone shared by two arms.
+
+    The returned pose is drop-allowed for the arm at ``pan_drop`` and
+    pickup-allowed for the arm at ``pan_pick`` (their overlapping reachable
+    zone). Candidates are biased toward the straight ``source``->``target`` line
+    via a Gaussian on the perpendicular distance, so the handover spot stays
+    roughly on the way. Raises ``ValueError`` if no shared pose is found within
+    ``max_attempts``.
+    """
+    line_dx = target.x - source.x
+    line_dy = target.y - source.y
+    line_len = math.hypot(line_dx, line_dy)
+    r_inner = CUBE_PLACEMENT_OVERLAY.inner_radius
+    r_outer = CUBE_PLACEMENT_OVERLAY.outer_radius
+    for _ in range(max_attempts):
+        # Sample inside the dropping arm's broad sector, then filter to the spot
+        # the picking arm can also reach with a vertical grasp.
+        r = rng.uniform(r_inner, r_outer)
+        theta = rng.uniform(AZIMUTH_MIN, AZIMUTH_MAX)
+        x = pan_drop[0] + r * math.cos(theta)
+        y = pan_drop[1] + r * math.sin(theta)
+        if not is_cube_drop_allowed(x, y, pan_drop):
+            continue
+        if not is_cube_pickup_allowed(x, y, pan_pick):
+            continue
+        if line_len > 0.0:
+            perp = abs(line_dx * (y - source.y) - line_dy * (x - source.x)) / line_len
+            if rng.random() > math.exp(-((perp / bias_sigma) ** 2)):
+                continue
+        yaw = float(rng.uniform(0.0, 2 * math.pi))
+        return CubePose(x=x, y=y, z=CUBE_HALF_SIZE, yaw=yaw)
+    raise ValueError("no handover pose found in the zone shared by both arms")
 
 
 def workspace_interior_corners_world() -> np.ndarray:
@@ -176,9 +245,16 @@ def add_workspace_overlays(
     spec: mujoco.MjSpec,
     parent: mujoco.MjsBody,
     *,
+    pan_axis: tuple[float, float] = PAN_AXIS,
     prefix: str = "",
 ) -> None:
-    """Add standard non-colliding workspace overlays in ``parent`` coordinates."""
+    """Add one arm's non-colliding reachable-sector overlays in ``parent`` coords.
+
+    The annular sectors recentre on ``pan_axis`` (so each arm draws its own
+    fan); ``prefix`` namespaces the geoms/meshes so several arms can coexist. The
+    world-fixed AprilTag exclusion boxes are added once via
+    :func:`add_cube_exclusion_overlays`.
+    """
     for overlay in WORKSPACE_OVERLAYS:
         name = f"{prefix}{overlay.name}"
         vertices, faces = _annular_sector_mesh(
@@ -192,32 +268,38 @@ def add_workspace_overlays(
             name=name,
             type=mujoco.mjtGeom.mjGEOM_MESH,
             meshname=mesh.name,
-            pos=(*_PAN_AXIS, overlay.z),
+            pos=(*pan_axis, overlay.z),
             rgba=_RGBA,
             contype=0,
             conaffinity=0,
             group=WORKSPACE_OVERLAY_GROUP,
         )
 
+    placement_name = f"{prefix}{CUBE_PLACEMENT_OVERLAY.name}"
     vertices, faces = _clipped_annular_sector_mesh(
         CUBE_PLACEMENT_OVERLAY.inner_radius,
         CUBE_PLACEMENT_OVERLAY.outer_radius,
         CUBE_PLACEMENT_BOUNDS,
+        pan_axis,
     )
-    mesh = spec.add_mesh(name=CUBE_PLACEMENT_OVERLAY.name)
+    mesh = spec.add_mesh(name=placement_name)
     mesh.uservert = vertices.flatten()
     mesh.userface = faces.flatten()
     parent.add_geom(
-        name=CUBE_PLACEMENT_OVERLAY.name,
+        name=placement_name,
         type=mujoco.mjtGeom.mjGEOM_MESH,
         meshname=mesh.name,
-        pos=(*_PAN_AXIS, CUBE_PLACEMENT_OVERLAY.z),
+        pos=(*pan_axis, CUBE_PLACEMENT_OVERLAY.z),
         rgba=_CUBE_PLACEMENT_RGBA,
         contype=0,
         conaffinity=0,
         group=WORKSPACE_OVERLAY_GROUP,
     )
 
+
+def add_cube_exclusion_overlays(spec: mujoco.MjSpec, parent: mujoco.MjsBody) -> None:
+    """Add the world-fixed AprilTag-plate exclusion boxes (shared by all arms)."""
+    del spec  # geoms only; no meshes to register
     for _, corner_name, tag_pos in WORKSPACE_FRAME_APRILTAG_PLATES:
         tag_x, tag_y = _frame_to_world_xy(tag_pos[0], tag_pos[1])
         parent.add_geom(
@@ -240,14 +322,19 @@ def _clipped_annular_sector_mesh(
     inner_radius: float,
     outer_radius: float,
     bounds: tuple[float, float, float, float],
+    pan_axis: tuple[float, float] = _PAN_AXIS,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return the annular sector clipped to an axis-aligned center rectangle."""
+    """Return the annular sector clipped to an axis-aligned center rectangle.
+
+    The mesh is centred at the pan axis (geoms place it at ``pos=pan_axis``), so
+    the rectangle bounds are taken relative to ``pan_axis``.
+    """
     x_min, x_max, y_min, y_max = bounds
     local_bounds = (
-        x_min - _PAN_AXIS[0],
-        x_max - _PAN_AXIS[0],
-        y_min - _PAN_AXIS[1],
-        y_max - _PAN_AXIS[1],
+        x_min - pan_axis[0],
+        x_max - pan_axis[0],
+        y_min - pan_axis[1],
+        y_max - pan_axis[1],
     )
     sections: list[tuple[float, float, float]] = []
     for angle in np.linspace(_AZIMUTH_MIN, _AZIMUTH_MIN + _AZIMUTH_LENGTH, _SEGMENTS + 1):

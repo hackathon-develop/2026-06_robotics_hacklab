@@ -683,7 +683,8 @@ def plan_carry_candidates(
     can still fall through to the broader free-pitch search.
     """
     grasp_gripper = grasp.pregrasp_matrix
-    if not is_cube_drop_allowed(target.x, target.y):
+    pan_axis = (float(k.pan_axis[0]), float(k.pan_axis[1]))
+    if not is_cube_drop_allowed(target.x, target.y, pan_axis):
         return
     low_grasp_cube = world_from_cube(_pushed_cube(source, grasp.inward_normal, SAFETY_MARGIN))
     cube_from_gripper = np.linalg.inv(low_grasp_cube) @ grasp_gripper
@@ -713,7 +714,7 @@ def plan_carry_candidates(
     }
     plans: list[tuple[tuple[int, float, float, int], CarryPlan]] = []
     target_allows_vertical_drop = drop_orientation == "free" and is_vertical_grip_allowed(
-        target.x, target.y
+        target.x, target.y, pan_axis
     )
 
     def consider_plan(plan: CarryPlan, mode_index: int, priority: int) -> None:
