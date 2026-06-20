@@ -70,11 +70,13 @@ export function buildWorkspaceOverlaySpecs(k: So101Kinematics): WorkspaceOverlay
   ];
 }
 
-// Add overlay meshes to `scene` and return a disposer that removes and frees them.
+// Add overlay meshes to `parent` (a scene or any group) and return a disposer
+// that removes the meshes and frees their GPU resources.
 export function addWorkspaceOverlaysToScene(
-  scene: THREE.Scene,
+  parent: THREE.Object3D,
   specs: WorkspaceOverlaySpec[]
 ): () => void {
+  const meshes: THREE.Mesh[] = [];
   const geometries: THREE.RingGeometry[] = [];
   const materials: THREE.MeshBasicMaterial[] = [];
 
@@ -93,12 +95,14 @@ export function addWorkspaceOverlaysToScene(
     // RingGeometry lies in the XY plane; stagger z slightly to avoid z-fighting.
     mesh.position.set(ws.center.x, ws.center.y, 0.0002 + i * 0.0002);
     mesh.renderOrder = i - specs.length;
-    scene.add(mesh);
+    parent.add(mesh);
+    meshes.push(mesh);
     geometries.push(geo);
     materials.push(mat);
   }
 
   return () => {
+    for (const mesh of meshes) { mesh.removeFromParent(); }
     for (const geo of geometries) { geo.dispose(); }
     for (const mat of materials) { mat.dispose(); }
   };

@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "dev:table-layout": "vite --config vite.config.table-layout.ts --open /table-layout.html",
+    "build:table-layout": "tsc && vite build --config vite.config.table-layout.ts && mv dist-table-layout/table-layout.html dist-table-layout/index.html",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

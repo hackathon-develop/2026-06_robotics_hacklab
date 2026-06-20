@@ -42,6 +42,10 @@ import {
 import {
   initStandardSceneVisualization,
   type StandardSceneVisualization } from './visualizations/standard-scene';
+import {
+  initTableLayoutVisualization,
+  type TableLayoutVisualization
+} from './visualizations/table-layout';
 
 let dummyVisualization: DummyVisualization | null = null;
 let standardSceneVisualization: StandardSceneVisualization | null = null;
@@ -53,6 +57,7 @@ let bodyTreeVisualization: BodyTreeVisualization | null = null;
 let simplePregraspPoseVisualization: SimplePregraspPoseVisualization | null = null;
 let simplePregraspIkVisualization: SimplePregraspIkVisualization | null = null;
 let pickAndPlaceVisualization: PickAndPlaceVisualization | null = null;
+let tableLayoutVisualization: TableLayoutVisualization | null = null;
 
 function initialize(): void {
   const dummyPanel = document.getElementById('dummy-visualization');
@@ -116,6 +121,16 @@ function initialize(): void {
       startFromAndReturnToRestPose: true
     }).then(viz => {
       pickAndPlaceVisualization = viz;
+    });
+  }
+
+  const tableLayoutPanel = document.getElementById('table-layout-visualization');
+  if (tableLayoutPanel) {
+    tableLayoutVisualization?.destroy();
+    tableLayoutVisualization = null;
+
+    void initTableLayoutVisualization(tableLayoutPanel).then(viz => {
+      tableLayoutVisualization = viz;
     });
   }
 
