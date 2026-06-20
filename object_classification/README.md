@@ -1,6 +1,6 @@
 # Object Classification
 
-Command-line object detection for PNG and JPEG images using a YOLO model.
+Command-line object detection from a camera feed using a YOLO model.
 
 ## Setup
 
@@ -13,13 +13,19 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python object_classification.py path/to/image.jpg
+python object_classification.py 0
 ```
 
 Use a specific YOLO weights file:
 
 ```bash
-python object_classification.py path/to/image.png --model path/to/model.pt
+python object_classification.py 0 --model path/to/model.pt
 ```
 
-The script reads the image into an in-memory buffer, loads it from that buffer, runs YOLO detection, and prints each detected object label with its bounding-box position.
+Filter to a comma-separated list of target classes:
+
+```bash
+python object_classification.py 0 --model rf-detr-base-o365 --target-classes screwdriver,hammer,wrench
+```
+
+The script opens the camera ID, runs detection in a loop, prints each detected object label with its bounding-box position, and displays an annotated camera window. Press `q` in the camera window or `Ctrl+C` to stop.

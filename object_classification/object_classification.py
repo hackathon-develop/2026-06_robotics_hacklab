@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Detect objects in a PNG or JPEG image with a YOLO or RF-DETR model."""
+"""Detect objects from a camera feed with a YOLO or RF-DETR model."""
 
 from __future__ import annotations
 
 import argparse
-import io
 import os
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
 
-SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 RF_DETR_MODEL_ALIASES = {"rf-detr-xl", "rfdetr-xl", "rfdetr-xlarge", "rf-detr-xlarge"}
 RF_DETR_O365_MODEL_ALIASES = {"rf-detr-base-o365", "rfdetr-base-o365"}
 YOLO_WORLD_TOOLS_MODEL_ALIASES = {
@@ -420,13 +418,13 @@ COCO_CLASS_NAMES: set[str] | None = None
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read an image into memory, run object detection, and print labels with positions."
+        description="Open a camera, run object detection in a loop, and display annotated frames."
     )
     parser.add_argument(
-        "image",
-        type=Path,
+        "camera_id",
+        type=int,
         nargs="?",
-        help="Path to a PNG or JPEG image.",
+        help="OpenCV camera ID to read from. Example: 0.",
     )
     parser.add_argument(
         "--model",
@@ -447,7 +445,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target-class",
-        help="Optional object class to check for and report. Example: screwdriver.",
+        help="Optional object class to filter and report. Example: screwdriver.",
+    )
+    parser.add_argument(
+        "--target-classes",
+        dest="target_classes_csv",
+        help="Optional comma-separated object classes to filter and report. Example: screwdriver,hammer,wrench.",
     )
     parser.add_argument(
         "--list-classes",
@@ -501,34 +504,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_image_to_buffer(image_path: Path) -> io.BytesIO:
-    return io.BytesIO(image_path.read_bytes())
-
-
-def validate_image_path(image_path: Path) -> None:
-    if not image_path.is_file():
-        raise SystemExit(f"Image file not found: {image_path}")
-
-    if image_path.suffix.lower() not in SUPPORTED_SUFFIXES:
-        supported = ", ".join(sorted(SUPPORTED_SUFFIXES))
-        raise SystemExit(f"Unsupported image type '{image_path.suffix}'. Use one of: {supported}")
-
-
-def load_buffered_image(image_buffer: io.BytesIO) -> Any:
+def camera_frame_to_image(frame: Any) -> Any:
     try:
-        from PIL import Image, UnidentifiedImageError
+        import cv2
+        from PIL import Image
     except ModuleNotFoundError as exc:
-        raise SystemExit("Missing dependency: install Pillow with 'pip install -r requirements.txt'.") from exc
+        raise SystemExit("Missing dependency: install OpenCV and Pillow with 'pip install -r requirements.txt'.") from exc
 
-    image_buffer.seek(0)
-    try:
-        image = Image.open(image_buffer)
-        image.verify()
-    except UnidentifiedImageError as exc:
-        raise ValueError("The input file is not a valid PNG or JPEG image.") from exc
+    return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-    image_buffer.seek(0)
-    return Image.open(image_buffer).convert("RGB")
+
+def parse_target_classes_csv(raw_value: str | None) -> list[str]:
+    if raw_value is None:
+        return []
+
+    target_classes = [normalize_label(value) for value in raw_value.split(",") if value.strip()]
+    if not target_classes:
+        raise SystemExit("--target-classes must contain at least one class name.")
+
+    return target_classes
+
+
+def target_classes_from_args(args: argparse.Namespace) -> list[str]:
+    target_classes = []
+    if args.target_class:
+        target_classes.append(normalize_label(args.target_class))
+
+    target_classes.extend(parse_target_classes_csv(args.target_classes_csv))
+
+    deduped_classes = []
+    for target_class in target_classes:
+        if target_class and target_class not in deduped_classes:
+            deduped_classes.append(target_class)
+
+    return deduped_classes
+
+
+def matches_target_classes(label: str, target_classes: list[str] | None) -> bool:
+    return not target_classes or normalize_label(label) in target_classes
+
+
+def target_classes_description(target_classes: list[str]) -> str:
+    return ", ".join(target_classes)
 
 
 def print_detection(label: str, confidence: float, xyxy: Iterable[float]) -> None:
@@ -723,7 +740,7 @@ def load_sam_naming_model(model_name: str, target_class: str | None = None) -> t
             raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
 
         model = YOLOWorld(YOLO_WORLD_TOOLS_WEIGHTS)
-        model.set_classes(yolo_world_tool_classes(target_class))
+        model.set_classes(yolo_world_tool_classes([target_class] if target_class else None))
         return "yolo", model, None
 
     if is_rf_detr_model(model_name):
@@ -835,10 +852,15 @@ def print_sam_segmentations(
         print("No masks segmented.")
 
 
-def print_yolo_detections(results: Iterable[object], target_class: str | None = None) -> None:
+def print_yolo_detections(
+    results: Iterable[object],
+    target_class: str | None = None,
+    target_classes: list[str] | None = None,
+    class_name_lookup: list[str] | None = None,
+) -> None:
     found_detection = False
-    found_target = False
-    target_class = normalize_label(target_class) if target_class else None
+    found_printed_detection = False
+    target_classes = target_classes or ([normalize_label(target_class)] if target_class else [])
 
     for result in results:
         names = result.names
@@ -850,39 +872,134 @@ def print_yolo_detections(results: Iterable[object], target_class: str | None = 
         for box in boxes:
             found_detection = True
             class_id = int(box.cls[0])
-            label = class_name_from_names(names, class_id)
+            label = class_name_from_names(names, class_id, class_name_lookup=class_name_lookup)
             confidence = float(box.conf[0])
-            found_target = found_target or normalize_label(label) == target_class
+            if not matches_target_classes(label, target_classes):
+                continue
+
+            found_printed_detection = True
             print_detection(label, confidence, box.xyxy[0])
 
     if not found_detection:
         print("No objects detected.")
-    elif target_class and not found_target:
-        print(f"No '{target_class}' detections found.")
+    elif target_classes and not found_printed_detection:
+        print(f"No target detections found: {target_classes_description(target_classes)}.")
 
 
 def print_rf_detr_detections(
     detections: object,
     target_class: str | None = None,
+    target_classes: list[str] | None = None,
     class_name_lookup: list[str] | None = None,
 ) -> None:
     found_detection = False
-    found_target = False
+    found_printed_detection = False
     class_names = detections.data.get("class_name", [])
-    target_class = normalize_label(target_class) if target_class else None
+    target_classes = target_classes or ([normalize_label(target_class)] if target_class else [])
 
     for index, (xyxy, confidence, class_id) in enumerate(
         zip(detections.xyxy, detections.confidence, detections.class_id)
     ):
         found_detection = True
         label = rf_detr_label_for_detection(class_id, index, class_names, class_name_lookup)
-        found_target = found_target or normalize_label(label) == target_class
+        if not matches_target_classes(label, target_classes):
+            continue
+
+        found_printed_detection = True
         print_detection(label, float(confidence), xyxy)
 
     if not found_detection:
         print("No objects detected.")
-    elif target_class and not found_target:
-        print(f"No '{target_class}' detections found.")
+    elif target_classes and not found_printed_detection:
+        print(f"No target detections found: {target_classes_description(target_classes)}.")
+
+
+def draw_detection_box(frame: Any, cv2_module: Any, label: str, confidence: float | None, xyxy: Iterable[float]) -> None:
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = [int(round(float(value))) for value in xyxy]
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(x1 + 1, min(width, x2))
+    y2 = max(y1 + 1, min(height, y2))
+
+    text = label if confidence is None else f"{label} {confidence:.2f}"
+    color = (0, 255, 0)
+    cv2_module.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    text_size, baseline = cv2_module.getTextSize(text, cv2_module.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    text_y = max(y1, text_size[1] + baseline + 4)
+    cv2_module.rectangle(
+        frame,
+        (x1, text_y - text_size[1] - baseline - 4),
+        (x1 + text_size[0] + 4, text_y + baseline),
+        color,
+        -1,
+    )
+    cv2_module.putText(
+        frame,
+        text,
+        (x1 + 2, text_y - 2),
+        cv2_module.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 0),
+        2,
+        cv2_module.LINE_AA,
+    )
+
+
+def draw_yolo_detections(
+    frame: Any,
+    cv2_module: Any,
+    results: Iterable[object],
+    target_classes: list[str] | None = None,
+    class_name_lookup: list[str] | None = None,
+) -> None:
+    for result in results:
+        names = result.names
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            continue
+
+        for box in boxes:
+            class_id = int(box.cls[0])
+            label = class_name_from_names(names, class_id, class_name_lookup=class_name_lookup)
+            if not matches_target_classes(label, target_classes):
+                continue
+
+            draw_detection_box(frame, cv2_module, label, float(box.conf[0]), box.xyxy[0])
+
+
+def draw_rf_detr_detections(
+    frame: Any,
+    cv2_module: Any,
+    detections: object,
+    target_classes: list[str] | None = None,
+    class_name_lookup: list[str] | None = None,
+) -> None:
+    class_names = detections.data.get("class_name", [])
+    for index, (xyxy, confidence, class_id) in enumerate(
+        zip(detections.xyxy, detections.confidence, detections.class_id)
+    ):
+        label = rf_detr_label_for_detection(class_id, index, class_names, class_name_lookup)
+        if not matches_target_classes(label, target_classes):
+            continue
+
+        draw_detection_box(frame, cv2_module, label, float(confidence), xyxy)
+
+
+def draw_sam_segmentations(frame: Any, cv2_module: Any, results: Iterable[object]) -> None:
+    for result in results:
+        masks = result.masks
+        if masks is None or len(masks) == 0:
+            continue
+
+        boxes = result.boxes
+        box_values = boxes.xyxy if boxes is not None else []
+        confidences = boxes.conf if boxes is not None and getattr(boxes, "conf", None) is not None else []
+        for index, mask in enumerate(masks.data):
+            xyxy = box_values[index] if index < len(box_values) else mask_bbox_from_data(mask)
+            confidence = float(confidences[index]) if index < len(confidences) else None
+            draw_detection_box(frame, cv2_module, f"mask_{index + 1}", confidence, xyxy)
 
 
 def is_rf_detr_model(model_name: str) -> bool:
@@ -989,19 +1106,27 @@ def print_known_classes(model_name: str) -> None:
     print("Class listing is only available for RF-DETR and yolo-world-tools models in this script.")
 
 
-def validate_target_class(model_name: str, target_class: str | None) -> None:
-    if not target_class:
+def validate_target_classes(model_name: str, target_classes: list[str]) -> None:
+    if not target_classes:
         return
 
-    target_class = normalize_label(target_class)
     if is_rf_detr_o365_model(model_name):
         return
 
-    if is_rf_detr_model(model_name) and target_class not in get_coco_class_names():
+    if is_rf_detr_model(model_name):
+        coco_class_names = get_coco_class_names()
+        unknown_classes = [target_class for target_class in target_classes if target_class not in coco_class_names]
+        if not unknown_classes:
+            return
+
         raise SystemExit(
-            f"'{target_class}' is not in the RF-DETR-XL COCO class list. "
+            f"These classes are not in the RF-DETR-XL COCO class list: {target_classes_description(unknown_classes)}. "
             "Use a fine-tuned screwdriver model or try --model rf-detr-base-o365."
         )
+
+
+def validate_target_class(model_name: str, target_class: str | None) -> None:
+    validate_target_classes(model_name, [normalize_label(target_class)] if target_class else [])
 
 
 def validate_model_name(model_name: str) -> None:
@@ -1055,6 +1180,177 @@ def configure_model_environment() -> None:
     os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 
+def load_detection_model(
+    model_name: str,
+    target_class: str | None = None,
+    target_classes: list[str] | None = None,
+) -> tuple[str, object, list[str] | None]:
+    configure_model_environment()
+
+    if is_sam_model(model_name):
+        try:
+            from ultralytics import SAM
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
+
+        return "sam", SAM(sam_weights_for_model(model_name)), None
+
+    if is_yolo_world_tools_model(model_name):
+        try:
+            from ultralytics import YOLOWorld
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
+
+        model = YOLOWorld(YOLO_WORLD_TOOLS_WEIGHTS)
+        model.set_classes(yolo_world_tool_classes(target_classes or ([target_class] if target_class else None)))
+        return "yolo", model, None
+
+    if is_rf_detr_model(model_name):
+        if is_rf_detr_o365_model(model_name):
+            try:
+                from rfdetr import RFDETRBase
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise SystemExit("Missing dependency: install RF-DETR with 'pip install -r requirements.txt'.") from exc
+
+            model = RFDETRBase(pretrain_weights="rf-detr-base-o365.pth", num_classes=365)
+            model.model.class_names = ["__background__"] + OBJECTS365V2_CLASS_NAMES
+            return "rf-detr", model, OBJECTS365V2_CLASS_NAMES
+
+        try:
+            from rfdetr import RFDETRXLarge
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise SystemExit("Missing dependency: install RF-DETR-XL with 'pip install -r requirements.txt'.") from exc
+
+        return "rf-detr", RFDETRXLarge(num_classes=90), None
+
+    try:
+        from ultralytics import YOLO
+    except ModuleNotFoundError as exc:
+        raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
+
+    return "yolo", YOLO(yolo_weights_for_model(model_name)), None
+
+
+def run_loaded_detection(
+    image: Any,
+    loaded_model: tuple[str, object, list[str] | None],
+    confidence: float,
+    args: argparse.Namespace,
+    frame: Any | None = None,
+    cv2_module: Any | None = None,
+    sam_prompts: tuple[list[list[float]] | None, list[list[float]] | None, list[int] | None] | None = None,
+    sam_naming_model: tuple[str, object, list[str] | None] | None = None,
+) -> None:
+    model_type, model, class_name_lookup = loaded_model
+    target_classes = getattr(args, "target_classes", [])
+
+    if model_type == "sam":
+        bboxes, points, labels = sam_prompts or (None, None, None)
+        results = list(model.predict(
+            source=image,
+            bboxes=bboxes,
+            points=points,
+            labels=labels,
+            conf=confidence,
+            verbose=False,
+        ))
+        naming_confidence = args.sam_name_confidence if args.sam_name_confidence is not None else 0.05
+        print_sam_segmentations(
+            results,
+            image,
+            naming_model=sam_naming_model,
+            naming_confidence=naming_confidence,
+            max_name_masks=args.sam_max_name_masks,
+        )
+        if frame is not None and cv2_module is not None:
+            draw_sam_segmentations(frame, cv2_module, results)
+        return
+
+    if model_type == "rf-detr":
+        detections = model.predict(image, threshold=confidence)
+        print_rf_detr_detections(
+            detections,
+            target_class=args.target_class,
+            target_classes=target_classes,
+            class_name_lookup=class_name_lookup,
+        )
+        if frame is not None and cv2_module is not None:
+            draw_rf_detr_detections(
+                frame,
+                cv2_module,
+                detections,
+                target_classes=target_classes,
+                class_name_lookup=class_name_lookup,
+            )
+        return
+
+    results = list(model.predict(source=image, conf=confidence, verbose=False))
+    print_yolo_detections(
+        results,
+        target_class=args.target_class,
+        target_classes=target_classes,
+        class_name_lookup=class_name_lookup,
+    )
+    if frame is not None and cv2_module is not None:
+        draw_yolo_detections(
+            frame,
+            cv2_module,
+            results,
+            target_classes=target_classes,
+            class_name_lookup=class_name_lookup,
+        )
+
+
+def run_camera_detection_loop(args: argparse.Namespace, confidence: float) -> None:
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise SystemExit("Missing dependency: install OpenCV with 'pip install -r requirements.txt'.") from exc
+
+    capture = cv2.VideoCapture(args.camera_id)
+    if not capture.isOpened():
+        raise SystemExit(f"Could not open camera {args.camera_id}.")
+
+    try:
+        target_classes = getattr(args, "target_classes", [])
+        loaded_model = load_detection_model(args.model, target_class=args.target_class, target_classes=target_classes)
+        sam_prompts = sam_prompts_from_args(args) if is_sam_model(args.model) else None
+        sam_naming_model = None
+        if is_sam_model(args.model) and not args.no_sam_name:
+            sam_naming_model = load_sam_naming_model(args.sam_name_model, target_class=args.target_class)
+
+        frame_number = 0
+        window_name = f"Camera {args.camera_id} detections"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        print(f"Running inference on camera {args.camera_id}. Press q in the camera window or Ctrl+C to stop.")
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                raise SystemExit(f"Failed to read from camera {args.camera_id}.")
+
+            frame_number += 1
+            print(f"frame={frame_number}")
+            image = camera_frame_to_image(frame)
+            run_loaded_detection(
+                image,
+                loaded_model,
+                confidence,
+                args,
+                frame=frame,
+                cv2_module=cv2,
+                sam_prompts=sam_prompts,
+                sam_naming_model=sam_naming_model,
+            )
+            cv2.imshow(window_name, frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    except KeyboardInterrupt:
+        print("Stopped camera inference.")
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+
+
 def run_rf_detr_detection(image: Any, confidence: float, model_name: str, target_class: str | None = None) -> None:
     configure_model_environment()
 
@@ -1079,9 +1375,9 @@ def run_rf_detr_detection(image: Any, confidence: float, model_name: str, target
     print_rf_detr_detections(detections, target_class=target_class, class_name_lookup=class_name_lookup)
 
 
-def yolo_world_tool_classes(target_class: str | None = None) -> list[str]:
-    if target_class:
-        return [normalize_label(target_class)]
+def yolo_world_tool_classes(target_classes: list[str] | None = None) -> list[str]:
+    if target_classes:
+        return [normalize_label(target_class) for target_class in target_classes]
 
     return TOOL_CLASS_NAMES
 
@@ -1102,7 +1398,7 @@ def run_yolo_world_tools_detection(image: Any, confidence: float, target_class: 
         raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
 
     model = YOLOWorld(YOLO_WORLD_TOOLS_WEIGHTS)
-    model.set_classes(yolo_world_tool_classes(target_class))
+    model.set_classes(yolo_world_tool_classes([target_class] if target_class else None))
     results = model.predict(source=image, conf=confidence, verbose=False)
     print_yolo_detections(results, target_class=target_class)
 
@@ -1136,7 +1432,7 @@ def run_yolo_world_tools_detection(image: Any, confidence: float, target_class: 
         raise SystemExit("Missing dependency: install ultralytics with 'pip install -r requirements.txt'.") from exc
 
     model = YOLOWorld(YOLO_WORLD_TOOLS_WEIGHTS)
-    model.set_classes(yolo_world_tool_classes(target_class))
+    model.set_classes(yolo_world_tool_classes([target_class] if target_class else None))
     results = model.predict(source=image, conf=confidence, verbose=False)
     print_yolo_detections(results, target_class=target_class)
 
@@ -1199,41 +1495,17 @@ def main() -> None:
         print_known_classes(args.model)
         return
 
-    if args.image is None:
-        raise SystemExit("Image path is required unless --list-classes is used.")
+    if args.camera_id is None:
+        raise SystemExit("Camera ID is required unless --list-classes is used.")
 
     if args.sam_max_name_masks < 0:
         raise SystemExit("--sam-max-name-masks must be 0 or greater.")
 
-    validate_image_path(args.image)
+    args.target_classes = target_classes_from_args(args)
     validate_model_name(args.model)
-    validate_target_class(args.model, args.target_class)
-
-    image_buffer = read_image_to_buffer(args.image)
-    image = load_buffered_image(image_buffer)
+    validate_target_classes(args.model, args.target_classes)
     confidence = confidence_for_model(args)
-
-    if is_sam_model(args.model):
-        bboxes, points, labels = sam_prompts_from_args(args)
-        name_model = None if args.no_sam_name else args.sam_name_model
-        run_sam_segmentation(
-            image,
-            confidence,
-            args.model,
-            bboxes,
-            points,
-            labels,
-            name_model,
-            target_class=args.target_class,
-            name_confidence=args.sam_name_confidence,
-            max_name_masks=args.sam_max_name_masks,
-        )
-    elif is_yolo_world_tools_model(args.model):
-        run_yolo_world_tools_detection(image, confidence, target_class=args.target_class)
-    elif is_rf_detr_model(args.model):
-        run_rf_detr_detection(image, confidence, args.model, target_class=args.target_class)
-    else:
-        run_yolo_detection(image, args.model, confidence, target_class=args.target_class)
+    run_camera_detection_loop(args, confidence)
 
 
 if __name__ == "__main__":
