@@ -1,12 +1,6 @@
 # RoboSort SO-101
 
-<!--
-Hero image placeholder:
-Add a final system photo or demo GIF here.
-
-Example:
-![RoboSort SO-101 demo](docs/images/robosort-demo.gif)
--->
+![RoboSort SO-101 workspace](docs/images/real-workspace-front.jpeg)
 
 An AI-powered desk-cleaning and maintenance robot built around the SO-101 arm.
 The project started from a simple goal: detect random objects on a workspace,
@@ -23,18 +17,16 @@ Built for the 2026 Robotics Hacklab.
 
 ## Demo Preview
 
-> Add final demo images here before submission.
-
-| Workspace View | Detection View | Robot Action |
+| Real Workspace | Live Pick Setup | Simulation |
 | --- | --- | --- |
-| `docs/images/workspace.jpg` | `docs/images/detection.jpg` | `docs/images/pick-place.gif` |
+| ![SO-101 real workspace](docs/images/real-workspace-front.jpeg) | ![SO-101 can pick setup](docs/images/real-workspace-side.jpeg) | ![SO-101 MuJoCo simulation](docs/images/so101-simulation.jpg) |
 
-Suggested assets:
+| Overhead Camera Frame |
+| --- |
+| ![Overhead camera frame](docs/images/overhead-camera-frame.jpg) |
 
-- `docs/images/workspace.jpg`: full desk/workspace image
-- `docs/images/detection.jpg`: camera frame with bounding boxes
-- `docs/images/pick-place.gif`: short robot pick-and-place GIF
-- `docs/images/system-diagram.png`: optional exported architecture diagram
+The final demo can additionally include a short `docs/images/pick-place.gif`
+showing the robot grasping and placing an object.
 
 ## What It Does
 
@@ -135,6 +127,48 @@ sequenceDiagram
     Planner->>Robot: Move to home coordinate
     Robot->>Robot: Release object
 ```
+
+## How It Actually Works
+
+The implementation is split into a perception stage, an analytic motion handoff,
+and a learned grasping stage.
+
+```mermaid
+flowchart LR
+    A[Overhead Camera Frame] --> B[first_pick_sequence.py]
+    B --> C[RF-DETR / YOLO Detection]
+    C --> D[Selected Class: Marker or Can]
+    D --> E[World Pick Pose]
+    E --> F[Hover Pose 15 cm Above Object]
+    F --> G[arm_hover_move.py]
+    G --> H[SO-101 Moves To Hover]
+    H --> I[run real.py]
+    I --> J[SmolVLA Grasp Handoff]
+    J --> K[Analytic Carry / Place / Drop]
+```
+
+Key implementation details:
+
+- `object_classification.py` runs camera-based detection and classification.
+- `pick_pose_node.py` projects the detection center from pixels to a world pick
+  coordinate using camera intrinsics, camera extrinsics, and table height.
+- `first_pick_sequence.py` is the perception orchestrator. It reads the overhead
+  camera, optionally reads the wrist camera, computes a hover pose above the
+  object, and can hand off to real robot movement.
+- `arm_hover_move.py` uses the SO-101 kinematics and IK layer to move the
+  follower arm to a hover pose before grasping.
+- `py/scripts/pick_and_place/real.py` performs the final real-hardware stage:
+  start from hover, use the fine-tuned SmolVLA checkpoint for grasping, then
+  continue the analytic carry/place/drop sequence.
+
+The current end-to-end command path supports:
+
+- camera-only detection with no arm movement
+- hover IK dry run with no arm movement
+- real hover-only handoff
+- full pick-and-place run without voice trigger
+- full pick-and-place run with voice trigger phrases such as `tidy up` or
+  `clean up`
 
 ## Hardware
 
@@ -275,6 +309,87 @@ python object_classification/first_pick_sequence.py --help
 
 This combines overhead pick detection with wrist alignment and emits structured
 pose data for the next motion layer.
+
+Camera-only perception test:
+
+```bash
+python object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --window-ms 3000 \
+  --debug
+```
+
+Hover IK dry run with no physical arm movement:
+
+```bash
+python object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --hover-offset 0.15 \
+  --move-arm \
+  --dry-run-arm \
+  --no-window \
+  --debug
+```
+
+Use these shared variables before the end-to-end commands:
+
+```bash
+export FOLLOWER_PORT=/dev/ttyACM0
+export OVERHEAD_CAMERA=4
+export WRIST_CAMERA=6
+export TARGET_CLASS=bottle
+export VLA_DEVICE=cpu
+export VLA_CHECKPOINT=/path/to/your/smolvla/checkpoint/pretrained_model
+```
+
+Full end-to-end run:
+
+```bash
+python object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --hover-offset 0.15 \
+  --move-arm \
+  --handoff-at-hover \
+  --run-real-place \
+  --follower-port "$FOLLOWER_PORT" \
+  --real-episodes 1 \
+  --real-task "Pick and grab the object." \
+  --real-target-drop-zone \
+  --real-drop-zone-color black \
+  --real-vla-checkpoint "$VLA_CHECKPOINT" \
+  --real-vla-device "$VLA_DEVICE" \
+  --real-grasp-max-ticks 150 \
+  --real-grasp-max-joint-speed 10 \
+  --debug
+```
+
+Voice-triggered run:
+
+```bash
+python object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --hover-offset 0.15 \
+  --move-arm \
+  --handoff-at-hover \
+  --run-real-place \
+  --follower-port "$FOLLOWER_PORT" \
+  --real-episodes 1 \
+  --real-task "Pick and grab the object." \
+  --real-target-drop-zone \
+  --real-drop-zone-color black \
+  --real-vla-checkpoint "$VLA_CHECKPOINT" \
+  --real-vla-device "$VLA_DEVICE" \
+  --voice-trigger \
+  --debug
+```
 
 ### 4. Move The Arm To A Hover Pose
 
