@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -96,22 +97,44 @@ class CameraReader:
     arm always acts on the most recent image rather than a buffered backlog.
     """
 
-    def __init__(self, source: str, width: int, height: int, label: str) -> None:
+    def __init__(
+        self,
+        source: str,
+        width: int,
+        height: int,
+        label: str,
+        *,
+        start_timeout: float = 10.0,
+    ) -> None:
         import cv2
 
         from pick_and_place.cam_align_solve import parse_index_or_path
 
-        backend = cv2.CAP_AVFOUNDATION if hasattr(cv2, "CAP_AVFOUNDATION") else cv2.CAP_ANY
+        self._label = label
+        backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
         self._cap = cv2.VideoCapture(parse_index_or_path(source), backend)
         if not self._cap.isOpened():
             raise RuntimeError(f"could not open {label} camera {source!r}")
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._lock = threading.Lock()
         self._frame = None
         self._running = True
+        self._wait_for_initial_frame(start_timeout)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+
+    def _wait_for_initial_frame(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                self._frame = frame
+                return
+            time.sleep(0.01)
+        self._cap.release()
+        raise RuntimeError(f"timed out waiting for the {self._label} camera stream to start")
 
     def _loop(self) -> None:
         while self._running:
@@ -124,14 +147,14 @@ class CameraReader:
         with self._lock:
             return self._frame
 
-    def wait_for_first(self, timeout: float = 2.0):
+    def wait_for_first(self, timeout: float = 10.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             frame = self.latest()
             if frame is not None:
                 return frame
             time.sleep(0.001)
-        raise RuntimeError("timed out waiting for the camera stream to start")
+        raise RuntimeError(f"timed out waiting for the {self._label} camera stream to start")
 
     def close(self) -> None:
         self._running = False
@@ -175,6 +198,12 @@ def main() -> None:
     )
     parser.add_argument("--camera", default="0", help="OpenCV index/path of the overhead camera")
     parser.add_argument("--wrist-camera", default="1", help="OpenCV index/path of the wrist camera")
+    parser.add_argument(
+        "--camera-start-timeout",
+        type=float,
+        default=10.0,
+        help="seconds to wait for each camera's first frame (default: 10)",
+    )
     parser.add_argument(
         "--steps",
         type=int,
@@ -227,10 +256,22 @@ def main() -> None:
         raise SystemExit(f"no calibrated intrinsics for {missing}; cannot undistort")
 
     print("Opening cameras...")
-    overhead = CameraReader(args.camera, 1920, 1080, "overhead")
-    wrist = CameraReader(args.wrist_camera, 1280, 720, "wrist")
-    first_overhead = overhead.wait_for_first()
-    first_wrist = wrist.wait_for_first()
+    overhead = wrist = None
+    try:
+        overhead = CameraReader(
+            args.camera, 1920, 1080, "overhead", start_timeout=args.camera_start_timeout
+        )
+        wrist = CameraReader(
+            args.wrist_camera, 1280, 720, "wrist", start_timeout=args.camera_start_timeout
+        )
+        first_overhead = overhead.wait_for_first(args.camera_start_timeout)
+        first_wrist = wrist.wait_for_first(args.camera_start_timeout)
+    except Exception:
+        if overhead is not None:
+            overhead.close()
+        if wrist is not None:
+            wrist.close()
+        raise
 
     # Every frame is rectified to the same SQUARE_SIZE square pinhole view the
     # offline dataset conversion produces, so the policy loads against that
@@ -286,6 +327,9 @@ def main() -> None:
         while True:
             overhead_bgr = overhead.latest()
             wrist_bgr = wrist.latest()
+            if overhead_bgr is None or wrist_bgr is None:
+                time.sleep(0.001)
+                continue
             overhead_rgb = cv2.cvtColor(overhead_bgr, cv2.COLOR_BGR2RGB)
             wrist_rgb = cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB)
             overhead_rgb = transform_frame(overhead_rgb, overhead_undistort_map, SQUARE_SIZE, cv2)
@@ -299,7 +343,8 @@ def main() -> None:
             }
             if wrist_writer is not None:
                 wrist_writer.append_data(wrist_rgb)
-                overhead_writer.append_data(overhead_rgb)
+                if overhead_writer is not None:
+                    overhead_writer.append_data(overhead_rgb)
 
             action = predict_action(
                 observation,
@@ -344,11 +389,14 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
-        overhead.close()
-        wrist.close()
+        if overhead is not None:
+            overhead.close()
+        if wrist is not None:
+            wrist.close()
         if wrist_writer is not None:
             wrist_writer.close()
-            overhead_writer.close()
+            if overhead_writer is not None:
+                overhead_writer.close()
         try:
             print("Parking to NEUTRAL then REST...")
             follower.bus.enable_torque()

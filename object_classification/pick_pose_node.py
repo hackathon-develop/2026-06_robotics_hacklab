@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Mario Gemoll
+# SPDX-License-Identifier: 0BSD
 """Overhead camera object detection → pick pose printer.
 
 Detects objects in an overhead camera feed and prints the best match as a
@@ -25,8 +27,10 @@ Press q in the camera window or Ctrl+C to stop.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -45,15 +49,30 @@ from object_classification import (
     rf_detr_label_for_detection,
 )
 
-import json
-
-# Default intrinsics JSON (two levels up from this file → repo root).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INTRINSICS_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "config"
-    / "camera_intrinsics"
-    / "overhead_camera.json"
+    _REPO_ROOT / "config" / "camera_intrinsics" / "overhead_camera.json"
 )
+
+
+@dataclass(frozen=True)
+class PickPose:
+    """One detected object projected onto a horizontal world plane."""
+
+    label: str
+    confidence: float
+    x: float
+    y: float
+    z: float
+    rx: float
+    ry: float
+    rz: float
+    cx: float
+    cy: float
+    xyxy: tuple[float, float, float, float]
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +213,75 @@ def _detect(
     return dets
 
 
+def target_classes_from_target_class(target_class: str) -> list[str]:
+    """Normalize the single-class filter used by this node's CLI."""
+    return [normalize_label(target_class)] if target_class.strip() else []
+
+
+def load_pick_pose_model(
+    model_name: str,
+    target_classes: list[str] | None = None,
+) -> tuple[str, Any, list[str] | None]:
+    """Configure and load the detector used by overhead pick-pose detection."""
+    configure_model_environment()
+    return load_detection_model(model_name, target_classes=target_classes or None)
+
+
+def pick_poses_from_frame(
+    frame: np.ndarray,
+    loaded_model: tuple[str, Any, list[str] | None],
+    target_classes: list[str],
+    confidence: float,
+    K: np.ndarray,
+    dist: np.ndarray,
+    cam_pos: np.ndarray,
+    cam_rot: np.ndarray,
+    pick_z: float,
+    *,
+    rx: float = 180.0,
+    ry: float = 0.0,
+    rz: float = 0.0,
+) -> list[PickPose]:
+    """Detect objects in one overhead frame and return world-plane pick poses.
+
+    Units match the current CLI: x/y/z are meters in the MuJoCo/world frame and
+    rx/ry/rz are degrees. The downstream arm layer can convert angles if it uses
+    radians internally.
+    """
+    pil_image = camera_frame_to_image(frame)
+    detections = _detect(pil_image, loaded_model, target_classes, confidence)
+    poses: list[PickPose] = []
+    for detection in detections:
+        world_x, world_y = _pixel_to_world_xy(
+            detection["cx"], detection["cy"], K, dist, cam_pos, cam_rot, pick_z
+        )
+        x1, y1, x2, y2 = [float(v) for v in detection["xyxy"]]
+        poses.append(
+            PickPose(
+                label=str(detection["label"]),
+                confidence=float(detection["confidence"]),
+                x=world_x,
+                y=world_y,
+                z=float(pick_z),
+                rx=float(rx),
+                ry=float(ry),
+                rz=float(rz),
+                cx=float(detection["cx"]),
+                cy=float(detection["cy"]),
+                xyxy=(x1, y1, x2, y2),
+            )
+        )
+    return poses
+
+
+def poses_by_label(poses: list[PickPose]) -> dict[str, list[dict[str, Any]]]:
+    """Group projected pick poses by label without discarding duplicates."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for pose in poses:
+        grouped.setdefault(pose.label, []).append(pose.as_dict())
+    return grouped
+
+
 # ---------------------------------------------------------------------------
 # Annotation
 # ---------------------------------------------------------------------------
@@ -225,8 +313,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="yolo11m.pt",
-        help="Detection model: yolo11m.pt, rf-detr-base-o365, yolo-world-tools, etc. (default: yolo11m.pt)",
+        default="rf-detr-base-o365",
+        help=(
+            "Detection model: rf-detr-base-o365, yolo11m.pt, yolo-world-tools, "
+            "etc. (default: rf-detr-base-o365)"
+        ),
     )
     parser.add_argument(
         "--confidence",
@@ -367,6 +458,7 @@ def main() -> None:
                 last_frame_size = (frame_w, frame_h)
                 K_scaled = _scale_K(K, calib_w, calib_h, frame_w, frame_h)
                 print(f"Frame {frame_w}×{frame_h} (calib {calib_w}×{calib_h}) — K scaled.")
+            assert K_scaled is not None
 
             pil_image = camera_frame_to_image(frame)
             detections = _detect(pil_image, loaded_model, target_classes, args.confidence)
