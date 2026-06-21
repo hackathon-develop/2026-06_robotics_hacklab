@@ -18,12 +18,48 @@ overhead view is ``camera1`` and the wrist is ``camera2``.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
 from pick_and_place.follower import JOINT_NAMES
 
 OVERHEAD_FEATURE = "observation.images.camera1"
 WRIST_FEATURE = "observation.images.camera2"
 DEFAULT_CHECKPOINT = "lerobot/smolvla_base"
-DEFAULT_INSTRUCTION = "Pick up the cube and place it on the target."
+# DEFAULT_INSTRUCTION = "Pick up the cube and place it on the target."
+DEFAULT_INSTRUCTION = "Pick and grab the object."
+
+
+def _install_lerobot_policies_stub() -> None:
+    """Bypass broken eager imports in ``lerobot.policies.__init__``.
+
+    Some LeRobot builds import every policy from ``lerobot.policies`` package
+    initialization. A broken unrelated policy can then prevent SmolVLA-only
+    runtime imports. Installing a minimal package module preserves normal
+    submodule resolution while avoiding that eager initializer.
+    """
+    existing = sys.modules.get("lerobot.policies")
+    if existing is not None and hasattr(existing, "__path__"):
+        return
+
+    import lerobot
+
+    spec = importlib.util.find_spec("lerobot")
+    if spec is None or spec.submodule_search_locations is None:
+        raise ImportError("could not locate the lerobot package")
+    package_root = Path(next(iter(spec.submodule_search_locations)))
+    policies_path = package_root / "policies"
+    if not policies_path.is_dir():
+        raise ImportError(f"could not locate lerobot policies directory: {policies_path}")
+
+    module = types.ModuleType("lerobot.policies")
+    module.__file__ = str(policies_path / "__init__.py")
+    module.__path__ = [str(policies_path)]
+    module.__package__ = "lerobot"
+    sys.modules["lerobot.policies"] = module
+    setattr(lerobot, "policies", module)
 
 
 def select_device(requested: str):
@@ -56,34 +92,64 @@ def make_policy(
     base ships its pretraining stats; a fine-tune saves the project dataset's),
     which is why the dataset stays in raw physical units.
     """
+    _install_lerobot_policies_stub()
+
+    from lerobot.configs.policies import PreTrainedConfig
     from lerobot.configs.types import FeatureType, PolicyFeature
-    from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+    import lerobot.policies.smolvla.processor_smolvla  # noqa: F401
+    from lerobot.processor import PolicyProcessorPipeline
+    from lerobot.processor.converters import (
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+    from lerobot.utils.constants import (
+        POLICY_POSTPROCESSOR_DEFAULT_NAME,
+        POLICY_PREPROCESSOR_DEFAULT_NAME,
+    )
 
     n_joints = len(JOINT_NAMES)
-    config = SmolVLAConfig(
-        input_features={
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(n_joints,)),
-            WRIST_FEATURE: PolicyFeature(
-                type=FeatureType.VISUAL, shape=(3, wrist_hw[0], wrist_hw[1])
-            ),
-            OVERHEAD_FEATURE: PolicyFeature(
-                type=FeatureType.VISUAL, shape=(3, overhead_hw[0], overhead_hw[1])
-            ),
-        },
-        output_features={
-            "action": PolicyFeature(type=FeatureType.ACTION, shape=(n_joints,)),
-        },
-        device=str(device),
-    )
+    checkpoint_path = Path(checkpoint)
+    if (checkpoint_path / "config.json").is_file():
+        config = PreTrainedConfig.from_pretrained(checkpoint)
+        if not isinstance(config, SmolVLAConfig):
+            raise TypeError(f"checkpoint {checkpoint!r} is {config.type!r}, expected 'smolvla'")
+        config.device = str(device)
+    else:
+        config = SmolVLAConfig(
+            input_features={
+                "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(n_joints,)),
+                WRIST_FEATURE: PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(3, wrist_hw[0], wrist_hw[1])
+                ),
+                OVERHEAD_FEATURE: PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(3, overhead_hw[0], overhead_hw[1])
+                ),
+            },
+            output_features={
+                "action": PolicyFeature(type=FeatureType.ACTION, shape=(n_joints,)),
+            },
+            device=str(device),
+        )
+    action_shape = config.output_features["action"].shape
+    if action_shape[0] != n_joints:
+        raise ValueError(
+            f"checkpoint action shape {action_shape} does not match robot joints ({n_joints})"
+        )
     policy = SmolVLAPolicy.from_pretrained(checkpoint, config=config)
     policy.to(device)
     policy.eval()
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=config,
-        pretrained_path=checkpoint,
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
+    preprocessor = PolicyProcessorPipeline.from_pretrained(
+        checkpoint,
+        config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+        overrides={"device_processor": {"device": str(device)}},
+    )
+    postprocessor = PolicyProcessorPipeline.from_pretrained(
+        checkpoint,
+        config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
     )
     return policy, preprocessor, postprocessor

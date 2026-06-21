@@ -38,3 +38,29 @@ HF_HUB_OFFLINE=1 lerobot-train \
   --num_workers=4 \
   --wandb.enable=true \
   --wandb.project=pick-and-place
+
+# Train Pi 0.5 on merged dataset with PEFT/LoRA. Pi 0.5 is much heavier than
+# SmolVLA, so this uses bf16, gradient checkpointing, expert-only training, and
+# no dataloader workers to reduce both GPU and system RAM pressure. Pi 0.5's
+# base checkpoint expects OpenPI camera names, not SmolVLA's camera1/camera2.
+
+lerobot-train \
+  --policy.path=lerobot/pi05_base \
+  --policy.push_to_hub=false \
+  --policy.dtype=bfloat16 \
+  --policy.use_amp=true \
+  --policy.gradient_checkpointing=true \
+  --policy.train_expert_only=true \
+  --peft.method_type=LORA \
+  --peft.r=8 \
+  --dataset.repo_id=pick-and-place-merged \
+  --dataset.root=/home/vrazer/workspace/robotics/pick-and-place/py/datasets/pick-and-place-merged \
+  --rename_map='{"observation.images.overhead": "observation.images.base_0_rgb", "observation.images.wrist": "observation.images.left_wrist_0_rgb"}' \
+  --output_dir=/home/vrazer/workspace/robotics/pick-and-place/py/scripts/outputs/train/pi05_pick_grab_peft_bf16 \
+  --steps=1024 \
+  --batch_size=1 \
+  --save_freq=500 \
+  --log_freq=10 \
+  --num_workers=0 \
+  --wandb.enable=true \
+  --wandb.project=pick-and-place-pi05

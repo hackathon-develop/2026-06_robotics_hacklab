@@ -50,6 +50,7 @@ from pick_and_place.follower import (
 from pick_and_place.trajectory import replan_remaining_candidates
 from pick_and_place.kinematics import So101Kinematics
 from pick_and_place.recorder import EpisodeRecorder
+from pick_and_place.vla import DEFAULT_INSTRUCTION
 
 
 # Wall-clock rate shared by physical control, motor readback, camera indexing,
@@ -327,6 +328,13 @@ def execute_episode(
     show_wrist_mixed: bool = False,
     failed_trajectory_dir: Path | str | None = None,
     free_grasp: bool = False,
+    policy_bundle=None,
+    vla_instruction: str = DEFAULT_INSTRUCTION,
+    vla_device=None,
+    grasp_max_ticks: int = 150,
+    grasp_max_joint_speed: float = 10.0,
+    descent_margin: float = 0.0,
+    ascent_margin: float = 0.0,
 ) -> str:
     """Run one pass of a prepared episode on an already-connected follower.
 
@@ -415,6 +423,8 @@ def execute_episode(
 
     record_queue: queue.Queue = queue.Queue()
     record_writer_thread = None
+    vla_maps = None
+    vla_predict_action = None
 
     def overhead_reader():
         nonlocal overhead_frame
@@ -446,6 +456,159 @@ def execute_episode(
                     "task": recording.task,
                 }
             )
+
+    def snapshot_camera_frames():
+        with cam_lock:
+            wrist_snapshot = None if cam_frame is None else cam_frame.copy()
+        with overhead_lock:
+            overhead_snapshot = None if overhead_frame is None else overhead_frame.copy()
+        return wrist_snapshot, overhead_snapshot
+
+    def queue_record_frame(
+        state: np.ndarray, action: np.ndarray, wrist_bgr, overhead_bgr
+    ) -> None:
+        if (
+            record_writer_thread is not None
+            and wrist_bgr is not None
+            and overhead_bgr is not None
+        ):
+            record_queue.put(
+                (
+                    state.astype(np.float32),
+                    action.astype(np.float32),
+                    wrist_bgr,
+                    overhead_bgr,
+                )
+            )
+
+    def ensure_vla_ready(first_wrist, first_overhead) -> None:
+        nonlocal vla_maps, vla_predict_action
+        if policy_bundle is None or vla_maps is not None:
+            return
+        if first_wrist is None or first_overhead is None:
+            raise RuntimeError("VLA grasp requires live wrist and overhead camera frames")
+
+        import cv2
+
+        from lerobot.utils.control_utils import predict_action
+        from pick_and_place.camera_intrinsics import load_local_camera_intrinsics
+        from pick_and_place.image_rectify import SQUARE_SIZE, build_undistort_map
+
+        intrinsics_by_camera = load_local_camera_intrinsics()
+        missing = [
+            cam
+            for cam in ("overhead_camera", "wrist_camera")
+            if cam not in intrinsics_by_camera
+        ]
+        if missing:
+            raise RuntimeError(f"no calibrated intrinsics for {missing}; cannot run VLA grasp")
+
+        wrist_map = build_undistort_map(
+            intrinsics_by_camera["wrist_camera"],
+            first_wrist.shape[1],
+            first_wrist.shape[0],
+            cv2,
+        )
+        overhead_map = build_undistort_map(
+            intrinsics_by_camera["overhead_camera"],
+            first_overhead.shape[1],
+            first_overhead.shape[0],
+            cv2,
+        )
+        vla_maps = (wrist_map, overhead_map, SQUARE_SIZE)
+        vla_predict_action = predict_action
+
+    def run_vla_grasp_segment(last_commanded: np.ndarray) -> np.ndarray:
+        """Run a bounded SmolVLA closed-loop segment from the current descent pose."""
+        import cv2
+
+        from pick_and_place.image_rectify import transform_frame
+        from pick_and_place.vla import OVERHEAD_FEATURE, WRIST_FEATURE
+
+        if policy_bundle is None:
+            return last_commanded
+        policy, preprocessor, postprocessor = policy_bundle
+        if hasattr(policy, "reset"):
+            policy.reset()
+        print(f"Running VLA grasp handoff for up to {grasp_max_ticks} ticks...")
+        if descent_margin or ascent_margin:
+            print(
+                f"  VLA margins: descent={descent_margin:.3f}m "
+                f"ascent={ascent_margin:.3f}m"
+            )
+
+        commanded = last_commanded.copy()
+        next_tick = time.monotonic()
+        tick = 0
+        while tick < grasp_max_ticks and viewer.is_running():
+            wrist_bgr, overhead_bgr = snapshot_camera_frames()
+            if wrist_bgr is None or overhead_bgr is None:
+                time.sleep(0.001)
+                continue
+
+            ensure_vla_ready(wrist_bgr, overhead_bgr)
+            wrist_map, overhead_map, image_size = vla_maps
+            overhead_rgb = cv2.cvtColor(overhead_bgr, cv2.COLOR_BGR2RGB)
+            wrist_rgb = cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB)
+            overhead_rgb = transform_frame(overhead_rgb, overhead_map, image_size, cv2)
+            wrist_rgb = transform_frame(wrist_rgb, wrist_map, image_size, cv2)
+
+            state = action_to_joints(follower.get_observation(), commanded).astype(np.float32)
+            observation = {
+                "observation.state": state,
+                WRIST_FEATURE: wrist_rgb,
+                OVERHEAD_FEATURE: overhead_rgb,
+            }
+            action = vla_predict_action(
+                observation,
+                policy,
+                vla_device,
+                preprocessor,
+                postprocessor,
+                use_amp=False,
+                task=vla_instruction,
+                robot_type="so101",
+            )
+            target = action.to("cpu").numpy().reshape(-1)[: len(JOINT_NAMES)]
+            target = clamp_and_warn(target, clamp_low, clamp_high, clip_warned)
+            commanded = target.copy()
+            if grasp_max_joint_speed > 0:
+                max_step = grasp_max_joint_speed / CONTROL_HZ
+                arm_delta = target[:GRIPPER_INDEX] - state[:GRIPPER_INDEX]
+                commanded[:GRIPPER_INDEX] = state[:GRIPPER_INDEX] + np.clip(
+                    arm_delta, -max_step, max_step
+                )
+
+            follower.send_action(joints_to_action(commanded))
+            actual = action_to_joints(follower.get_observation(), commanded)
+            measured_joints, measured_gripper = real_frame_to_sim(actual, offsets)
+            for name, value in measured_joints.items():
+                set_joint(model, data, name, value)
+                data.ctrl[actuator_id[name]] = value
+            set_joint(model, data, "gripper", measured_gripper)
+            data.ctrl[actuator_id["gripper"]] = measured_gripper
+            mujoco.mj_step(model, data, nstep=simulation_steps_per_tick)
+            recorder.log(
+                commanded=commanded,
+                measured=actual,
+                t=data.time,
+                wall_t=time.monotonic() - execution_wall_start,
+            )
+            queue_record_frame(actual, commanded, wrist_bgr, overhead_bgr)
+            viewer.sync()
+
+            if tick % 10 == 0:
+                np.set_printoptions(precision=2, suppress=True)
+                print(f"  VLA tick {tick:4d}  action={commanded}")
+
+            tick += 1
+            next_tick += control_period
+            remaining = next_tick - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            elif remaining < -control_period:
+                next_tick = time.monotonic()
+        return commanded
 
     if wrist_camera is not None and wrist_cam_id >= 0:
         import cv2
@@ -526,13 +689,14 @@ def execute_episode(
         print("Ramping real arm to the trajectory start pose...")
         ramp_to_start(follower, start_real, model, data, viewer)
 
-        # Recording starts only after the unrecorded ramp reaches the start pose.
-        # The wrist reader is already running from the open block above; the
-        # overhead reader is started here. Recording needs both cameras.
-        if recording is not None:
+        # Recording/VLA starts only after the unrecorded ramp reaches the start
+        # pose. The wrist reader is already running from the open block above;
+        # the overhead reader is started here.
+        needs_episode_cameras = recording is not None or policy_bundle is not None
+        if needs_episode_cameras:
             if wrist_cam is None or overhead_camera_cap is None or not overhead_camera_cap.isOpened():
                 raise RuntimeError(
-                    "Recording requires both the wrist and overhead cameras to be open"
+                    "Recording/VLA requires both the wrist and overhead cameras to be open"
                 )
             _request_camera_fps(overhead_camera_cap, "overhead")
             overhead_cam_running = True
@@ -553,10 +717,12 @@ def execute_episode(
             else:
                 raise RuntimeError("Timed out waiting for the episode camera streams to start")
 
-            if recording.dataset is None:
+            ensure_vla_ready(first_wrist, first_overhead)
+            if recording is not None and recording.dataset is None:
                 recording.create_dataset(first_wrist.shape, first_overhead.shape)
-            record_writer_thread = threading.Thread(target=record_writer, daemon=True)
-            record_writer_thread.start()
+            if recording is not None:
+                record_writer_thread = threading.Thread(target=record_writer, daemon=True)
+                record_writer_thread.start()
         execution_wall_start = time.monotonic()
 
         # State for tracking progress
@@ -564,6 +730,115 @@ def execute_episode(
         completed_phase_name = None
         dynamic_source = episode.source
         dynamic_grasp = current_traj.grasp
+        commanded = start_real.copy()
+
+        def replan_from_measured(completed_name: str):
+            actual = action_to_joints(follower.get_observation(), commanded)
+            measured_joints, measured_gripper = real_frame_to_sim(actual, offsets)
+            measured_shadow = mujoco.MjData(model)
+            for joint_name, value in measured_joints.items():
+                set_joint(model, measured_shadow, joint_name, value)
+            set_joint(model, measured_shadow, "gripper", measured_gripper)
+            mujoco.mj_forward(model, measured_shadow)
+            clearance = jaw_floor_clearance(model, measured_shadow, jaw_geom_ids(model))
+            if clearance < 0.005:
+                print(f"Measured sim jaw clearance before replan: {clearance * 1000:+.1f} mm")
+
+            print(f"Replanning remaining trajectory after {completed_name}...")
+            candidate_traj = None
+            rejected_traj = None
+            rejected_detail = None
+            rejected_unexpected: list[tuple[float, str, str]] = []
+            for replan_index, replan_traj in enumerate(
+                replan_remaining_candidates(
+                    kinematics,
+                    measured_joints,
+                    measured_gripper,
+                    completed_name,
+                    dynamic_source,
+                    episode.target,
+                    dynamic_grasp,
+                    episode.end_joints,
+                    episode.end_gripper,
+                    drop_orientation=episode.trajectory.drop_orientation,
+                    free_grasp=free_grasp,
+                ),
+                start=1,
+            ):
+                if failed_trajectory_path is not None:
+                    detail_events = _preflight(
+                        model,
+                        replan_traj,
+                        actuator_id,
+                        robot_geom_ids,
+                        env_geom_ids,
+                        detailed=True,
+                    )
+                    unexpected_detail = [
+                        event
+                        for event in detail_events
+                        if _preflight_collision_is_unexpected(event)
+                    ]
+                    unexpected = [
+                        (event.time, event.geom1, event.geom2) for event in unexpected_detail
+                    ]
+                else:
+                    events = _preflight(
+                        model, replan_traj, actuator_id, robot_geom_ids, env_geom_ids
+                    )
+                    unexpected_detail = None
+                    unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
+                if not unexpected:
+                    if replan_index > 1:
+                        print(
+                            f"Selected replan candidate {replan_index} after preflight rejections."
+                        )
+                    return replan_traj
+                rejected_traj = replan_traj
+                rejected_detail = unexpected_detail
+                rejected_unexpected = unexpected
+                if replan_traj.carry is not None:
+                    print(
+                        f"  rejected replan candidate {replan_index}: "
+                        f"carry={replan_traj.carry.mode} collision t={unexpected[0][0]:.3f}s "
+                        f"{unexpected[0][1]} ↔ {unexpected[0][2]}"
+                    )
+
+            if rejected_traj is None:
+                print("Error: No feasible plan from current state. Aborting episode.")
+                reason = f"no feasible replan after {completed_name}"
+            else:
+                print("Error: All replan candidates failed preflight. Aborting episode.")
+                for t, n1, n2 in rejected_unexpected:
+                    print(f"  collision t={t:.3f}s {n1} ↔ {n2}")
+                reason = f"all replan candidates failed preflight after {completed_name}"
+                if failed_trajectory_path is not None and rejected_detail is not None:
+                    path = failed_trajectory_path / (
+                        f"replan_after_{completed_name or 'start'}_failed.npz"
+                    )
+                    _save_failed_preflight_trajectory(
+                        path,
+                        model,
+                        rejected_traj,
+                        actuator_id,
+                        rejected_detail,
+                    )
+                    print(f"saved rejected replan trajectory: {path}")
+            _write_failed_trajectory_note(
+                failed_trajectory_path,
+                reason,
+                source=dynamic_source,
+                target=episode.target,
+            )
+            return None
+
+        if policy_bundle is not None and viewer.is_running():
+            print("Starting VLA grasp from current pose; skipping analytic approach/descent.")
+            commanded = run_vla_grasp_segment(commanded)
+            current_traj = replan_from_measured("lift")
+            if current_traj is None:
+                episode_status = "restart"
+                return "restart"
 
         while current_traj is not None and current_traj.phases and viewer.is_running():
             phase = current_traj.phases[0]
@@ -812,19 +1087,8 @@ def execute_episode(
                 # joints as state, the commanded joints as action, and a snapshot
                 # of each camera's latest frame.
                 if record_writer_thread is not None:
-                    with cam_lock:
-                        wrist_snapshot = cam_frame
-                    with overhead_lock:
-                        overhead_snapshot = overhead_frame
-                    if wrist_snapshot is not None and overhead_snapshot is not None:
-                        record_queue.put(
-                            (
-                                actual.astype(np.float32),
-                                commanded.astype(np.float32),
-                                wrist_snapshot,
-                                overhead_snapshot,
-                            )
-                        )
+                    wrist_snapshot, overhead_snapshot = snapshot_camera_frames()
+                    queue_record_frame(actual, commanded, wrist_snapshot, overhead_snapshot)
 
                 viewer.sync()
 
@@ -903,106 +1167,8 @@ def execute_episode(
                 episode_status = "success"
                 break  # All phases completed
 
-            # Sense: get actual joints
-            actual = action_to_joints(follower.get_observation(), commanded)
-            measured_joints, measured_gripper = real_frame_to_sim(actual, offsets)
-            measured_shadow = mujoco.MjData(model)
-            for name, value in measured_joints.items():
-                set_joint(model, measured_shadow, name, value)
-            set_joint(model, measured_shadow, "gripper", measured_gripper)
-            mujoco.mj_forward(model, measured_shadow)
-            clearance = jaw_floor_clearance(model, measured_shadow, jaw_geom_ids(model))
-            if clearance < 0.005:
-                print(f"Measured sim jaw clearance before replan: {clearance * 1000:+.1f} mm")
-
-            print(f"Replanning remaining trajectory after {completed_phase_name}...")
-            candidate_traj = None
-            rejected_traj = None
-            rejected_detail = None
-            rejected_unexpected: list[tuple[float, str, str]] = []
-            for replan_index, replan_traj in enumerate(
-                replan_remaining_candidates(
-                    kinematics,
-                    measured_joints,
-                    measured_gripper,
-                    completed_phase_name,
-                    dynamic_source,
-                    episode.target,
-                    dynamic_grasp,
-                    episode.end_joints,
-                    episode.end_gripper,
-                    drop_orientation=episode.trajectory.drop_orientation,
-                    free_grasp=free_grasp,
-                ),
-                start=1,
-            ):
-                if failed_trajectory_path is not None:
-                    detail_events = _preflight(
-                        model,
-                        replan_traj,
-                        actuator_id,
-                        robot_geom_ids,
-                        env_geom_ids,
-                        detailed=True,
-                    )
-                    unexpected_detail = [
-                        event
-                        for event in detail_events
-                        if _preflight_collision_is_unexpected(event)
-                    ]
-                    unexpected = [
-                        (event.time, event.geom1, event.geom2) for event in unexpected_detail
-                    ]
-                else:
-                    events = _preflight(
-                        model, replan_traj, actuator_id, robot_geom_ids, env_geom_ids
-                    )
-                    unexpected_detail = None
-                    unexpected = [(t, n1, n2) for t, n1, n2 in events if is_unexpected(n1, n2)]
-                if not unexpected:
-                    candidate_traj = replan_traj
-                    if replan_index > 1:
-                        print(
-                            f"Selected replan candidate {replan_index} after preflight rejections."
-                        )
-                    break
-                rejected_traj = replan_traj
-                rejected_detail = unexpected_detail
-                rejected_unexpected = unexpected
-                if replan_traj.carry is not None:
-                    print(
-                        f"  rejected replan candidate {replan_index}: "
-                        f"carry={replan_traj.carry.mode} collision t={unexpected[0][0]:.3f}s "
-                        f"{unexpected[0][1]} ↔ {unexpected[0][2]}"
-                    )
-
+            candidate_traj = replan_from_measured(completed_phase_name)
             if candidate_traj is None:
-                if rejected_traj is None:
-                    print("Error: No feasible plan from current state. Aborting episode.")
-                    reason = f"no feasible replan after {completed_phase_name}"
-                else:
-                    print("Error: All replan candidates failed preflight. Aborting episode.")
-                    for t, n1, n2 in rejected_unexpected:
-                        print(f"  collision t={t:.3f}s {n1} ↔ {n2}")
-                    reason = f"all replan candidates failed preflight after {completed_phase_name}"
-                    if failed_trajectory_path is not None and rejected_detail is not None:
-                        path = failed_trajectory_path / (
-                            f"replan_after_{completed_phase_name or 'start'}_failed.npz"
-                        )
-                        _save_failed_preflight_trajectory(
-                            path,
-                            model,
-                            rejected_traj,
-                            actuator_id,
-                            rejected_detail,
-                        )
-                        print(f"saved rejected replan trajectory: {path}")
-                _write_failed_trajectory_note(
-                    failed_trajectory_path,
-                    reason,
-                    source=dynamic_source,
-                    target=episode.target,
-                )
                 episode_status = "restart"
                 return "restart"
 

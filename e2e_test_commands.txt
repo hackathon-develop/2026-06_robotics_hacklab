@@ -1,0 +1,242 @@
+# End-to-end pick-and-place test commands
+#
+# Copy/paste one block at a time. Do not paste the whole file at once.
+# These commands assume:
+# - overhead camera index is 4
+# - wrist camera index is 6
+# - follower arm is on /dev/ttyACM0
+# - target object class is bottle
+# - black square is the drop zone
+# - VLA instruction is exactly: Pick and grab the object.
+
+
+###############################################################################
+# 0. Shared variables
+###############################################################################
+
+cd /home/vrazer/workspace/robotics/pick-and-place
+
+export PY=/home/vrazer/anaconda3/envs/lerobot312/bin/python
+export FOLLOWER_PORT=/dev/ttyACM0
+export OVERHEAD_CAMERA=4
+export WRIST_CAMERA=6
+export TARGET_CLASS=bottle
+export VLA_DEVICE=cpu
+export VLA_CHECKPOINT=/home/vrazer/workspace/robotics/pick-and-place/outputs/train/2026-06-21/10-29-09_smolvla/checkpoints/006000/pretrained_model
+
+
+###############################################################################
+# 1. Fast software sanity checks, no hardware movement
+###############################################################################
+
+$PY -m py_compile \
+  object_classification/first_pick_sequence.py \
+  object_classification/arm_hover_move.py \
+  object_classification/voice_trigger.py \
+  py/scripts/pick_and_place/real.py \
+  py/src/pick_and_place/vla.py \
+  py/src/pick_and_place/executor.py
+
+$PY object_classification/first_pick_sequence.py --help
+
+$PY py/scripts/pick_and_place/real.py --help
+
+
+###############################################################################
+# 2. Camera-only object detection test, no arm movement
+#
+# Expected result:
+# - Opens the overhead camera window.
+# - Draws RF-DETR detections.
+# - Prints selected object world pose and hover pose.
+# - Does not connect to or move the arm.
+###############################################################################
+
+$PY object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --window-ms 3000 \
+  --debug
+
+
+###############################################################################
+# 3. Hover IK dry run, no arm movement
+#
+# Expected result:
+# - Detects the object.
+# - Computes the hover pose 15 cm above the detected object/table plane.
+# - Solves the arm move without connecting to the follower.
+###############################################################################
+
+$PY object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --hover-offset 0.15 \
+  --move-arm \
+  --dry-run-arm \
+  --no-window \
+  --debug
+
+
+###############################################################################
+# 4. Real hover-only handoff test, moves the arm but does not run placement
+#
+# Expected result:
+# - Detects the object.
+# - Moves the SO-101 to the hover pose 15 cm above the object.
+# - Holds at hover instead of returning home.
+# - Use this before the full end-to-end run if you want to verify the hover pose.
+###############################################################################
+
+$PY object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --hover-offset 0.15 \
+  --move-arm \
+  --handoff-at-hover \
+  --follower-port "$FOLLOWER_PORT" \
+  --no-window \
+  --debug
+
+
+###############################################################################
+# 5. Full end-to-end run without voice trigger
+#
+# Expected result:
+# - Detects the object from the overhead camera.
+# - Moves to hover 15 cm above the detected object.
+# - Keeps the arm at hover and launches py/scripts/pick_and_place/real.py.
+# - real.py starts from the current physical pose.
+# - real.py uses the fine-tuned SmolVLA checkpoint for grasp handoff.
+# - real.py then continues analytic carry/place/drop on the black target square.
+###############################################################################
+
+$PY object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --hover-offset 0.15 \
+  --move-arm \
+  --handoff-at-hover \
+  --run-real-place \
+  --follower-port "$FOLLOWER_PORT" \
+  --real-episodes 1 \
+  --real-task "Pick and grab the object." \
+  --real-target-drop-zone \
+  --real-drop-zone-color black \
+  --real-vla-checkpoint "$VLA_CHECKPOINT" \
+  --real-vla-device "$VLA_DEVICE" \
+  --real-grasp-max-ticks 150 \
+  --real-grasp-max-joint-speed 10 \
+  --real-descent-margin 0.0 \
+  --real-ascent-margin 0.0 \
+  --debug
+
+
+###############################################################################
+# 6. Full end-to-end run with voice trigger
+#
+# Expected result:
+# - Preloads model/cameras first.
+# - Waits for one of these phrases:
+#   folly start tidying up
+#   tidy up
+#   clean up
+# - Starts immediately after the phrase is recognized.
+###############################################################################
+
+$PY object_classification/first_pick_sequence.py "$OVERHEAD_CAMERA" \
+  --wrist-camera-id "$WRIST_CAMERA" \
+  --target-class "$TARGET_CLASS" \
+  --pick-z 0.0 \
+  --hover-offset 0.15 \
+  --move-arm \
+  --handoff-at-hover \
+  --run-real-place \
+  --follower-port "$FOLLOWER_PORT" \
+  --real-episodes 1 \
+  --real-task "Pick and grab the object." \
+  --real-target-drop-zone \
+  --real-drop-zone-color black \
+  --real-vla-checkpoint "$VLA_CHECKPOINT" \
+  --real-vla-device "$VLA_DEVICE" \
+  --real-grasp-max-ticks 150 \
+  --real-grasp-max-joint-speed 10 \
+  --real-descent-margin 0.0 \
+  --real-ascent-margin 0.0 \
+  --voice-trigger \
+  --debug
+
+
+###############################################################################
+# 7. Optional direct real.py test, only after the arm is already at hover
+#
+# Use this if first_pick_sequence already moved the arm to hover and you want to
+# manually test the final real.py stage. Replace SOURCE_X and SOURCE_Y with the
+# detected object world x/y printed by first_pick_sequence.
+###############################################################################
+
+export SOURCE_X=0.20
+export SOURCE_Y=0.00
+
+$PY py/scripts/pick_and_place/real.py \
+  --episodes 1 \
+  --source "$SOURCE_X" "$SOURCE_Y" \
+  --target-drop-zone \
+  --drop-zone-color black \
+  --start-from-current \
+  --follower-port "$FOLLOWER_PORT" \
+  --camera "$OVERHEAD_CAMERA" \
+  --wrist-camera "$WRIST_CAMERA" \
+  --task "Pick and grab the object." \
+  --vla-checkpoint "$VLA_CHECKPOINT" \
+  --vla-device "$VLA_DEVICE" \
+  --grasp-max-ticks 150 \
+  --grasp-max-joint-speed 10 \
+  --descent-margin 0.0 \
+  --ascent-margin 0.0
+
+
+###############################################################################
+# 8. Optional safer short VLA smoke test from current hover
+#
+# Same as the direct real.py test, but limits the VLA handoff to 30 ticks.
+# Use this for a first live policy check.
+###############################################################################
+
+$PY py/scripts/pick_and_place/real.py \
+  --episodes 1 \
+  --source "$SOURCE_X" "$SOURCE_Y" \
+  --target-drop-zone \
+  --drop-zone-color black \
+  --start-from-current \
+  --follower-port "$FOLLOWER_PORT" \
+  --camera "$OVERHEAD_CAMERA" \
+  --wrist-camera "$WRIST_CAMERA" \
+  --task "Pick and grab the object." \
+  --vla-checkpoint "$VLA_CHECKPOINT" \
+  --vla-device "$VLA_DEVICE" \
+  --grasp-max-ticks 30 \
+  --grasp-max-joint-speed 5 \
+  --descent-margin 0.0 \
+  --ascent-margin 0.0
+
+
+###############################################################################
+# Notes
+###############################################################################
+
+# If CUDA works on this machine, change this before running the full test:
+# export VLA_DEVICE=cuda
+
+# If the VLA checkpoint path changes, update VLA_CHECKPOINT in section 0.
+
+# If OpenCV camera numbering changes, update OVERHEAD_CAMERA and WRIST_CAMERA in section 0.
+
+# If the follower appears at a different serial port, update FOLLOWER_PORT in section 0.
+
+# If you want no MuJoCo 3D viewer during real.py, add this to the full commands:
+# --real-no-viewer

@@ -132,8 +132,9 @@ def move_to_hover_payload(
     control_hz: float = 30.0,
     max_joint_speed: float = 10.0,
     dry_run: bool = False,
+    return_home: bool = True,
 ) -> dict[str, Any]:
-    """Move through detected hover poses, returning home between each one."""
+    """Move through detected hover poses, optionally returning home after each one."""
     from pick_and_place import build_scene
     from pick_and_place.executor import clamp_and_warn, follower_clamp_limits
     from pick_and_place.follower import (
@@ -247,29 +248,37 @@ def move_to_hover_payload(
                 control_hz=control_hz,
                 max_joint_speed=max_joint_speed,
             )
-            print(f"[arm] returning home after object #{target['index']}", file=sys.stderr)
-            _ramp_follower(
-                follower,
-                target_real,
-                home_real,
-                duration=duration,
-                control_hz=control_hz,
-                max_joint_speed=max_joint_speed,
-            )
-            current_real = home_real
-    finally:
-        if follower is not None:
-            try:
-                measured = action_to_joints(follower.get_observation(), home_real)
-                print("[arm] final homing before disconnect", file=sys.stderr)
+            if return_home:
+                print(f"[arm] returning home after object #{target['index']}", file=sys.stderr)
                 _ramp_follower(
                     follower,
-                    measured,
+                    target_real,
                     home_real,
                     duration=duration,
                     control_hz=control_hz,
                     max_joint_speed=max_joint_speed,
                 )
+                current_real = home_real
+            else:
+                print(f"[arm] holding at object #{target['index']} for handoff", file=sys.stderr)
+                current_real = target_real
+                break
+    finally:
+        if follower is not None:
+            try:
+                measured = action_to_joints(follower.get_observation(), home_real)
+                if return_home:
+                    print("[arm] final homing before disconnect", file=sys.stderr)
+                    _ramp_follower(
+                        follower,
+                        measured,
+                        home_real,
+                        duration=duration,
+                        control_hz=control_hz,
+                        max_joint_speed=max_joint_speed,
+                    )
+                else:
+                    diagnostics["handoff_real"] = measured.tolist()
             finally:
                 follower.disconnect()
     return diagnostics
@@ -291,6 +300,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-hz", type=float, default=30.0, help="Command streaming rate.")
     parser.add_argument("--max-joint-speed", type=float, default=10.0, help="Arm joint speed cap in deg/s.")
     parser.add_argument("--dry-run", action="store_true", help="Solve and print targets without moving.")
+    parser.add_argument(
+        "--no-return-home",
+        action="store_true",
+        help="hold at the first hover pose for handoff instead of returning home",
+    )
     return parser.parse_args()
 
 
@@ -305,6 +319,7 @@ def main() -> None:
         control_hz=args.control_hz,
         max_joint_speed=args.max_joint_speed,
         dry_run=args.dry_run,
+        return_home=not args.no_return_home,
     )
     print(json.dumps(diagnostics, indent=2))
 

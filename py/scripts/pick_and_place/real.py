@@ -76,6 +76,12 @@ from pick_and_place.trajectory import (
     REST_ARM_JOINTS,
     REST_GRIPPER,
 )
+from pick_and_place.vla import (
+    DEFAULT_CHECKPOINT,
+    DEFAULT_INSTRUCTION,
+    make_policy,
+    select_device,
+)
 
 # How long a single look attempt stares at the camera feed before giving up and
 # moving to a fresh near-neutral pose to try again.
@@ -380,6 +386,11 @@ def main() -> None:
     parser.add_argument("--show-wrist-mixed", action="store_true", help="overlay the sim render on the wrist feed")
     parser.add_argument("--no-viewer", action="store_true", help="run headless (no 3D MuJoCo viewer)")
     parser.add_argument(
+        "--start-from-current",
+        action="store_true",
+        help="skip initial homing and plan from the current physical arm pose",
+    )
+    parser.add_argument(
         "--preflight-debug",
         action="store_true",
         help="print detailed collision diagnostics for rejected trajectory candidates",
@@ -415,8 +426,42 @@ def main() -> None:
     )
     parser.add_argument(
         "--task",
-        default="Pick up the cube and place it at the target.",
+        default=DEFAULT_INSTRUCTION,
         help="natural-language task instruction saved with every frame",
+    )
+    parser.add_argument(
+        "--vla-checkpoint",
+        default=DEFAULT_CHECKPOINT,
+        help="SmolVLA checkpoint used for the descend/grasp/lift handoff",
+    )
+    parser.add_argument(
+        "--vla-device",
+        default="auto",
+        help="device for VLA inference: auto | cpu | mps | cuda",
+    )
+    parser.add_argument(
+        "--grasp-max-ticks",
+        type=int,
+        default=150,
+        help="maximum VLA control ticks for the grasp handoff (default: 150)",
+    )
+    parser.add_argument(
+        "--grasp-max-joint-speed",
+        type=float,
+        default=10.0,
+        help="VLA arm-joint velocity cap in deg/s; <=0 disables (default: 10)",
+    )
+    parser.add_argument(
+        "--descent-margin",
+        type=float,
+        default=0.0,
+        help="reserved VLA descent safety margin in meters (default: 0)",
+    )
+    parser.add_argument(
+        "--ascent-margin",
+        type=float,
+        default=0.0,
+        help="reserved VLA ascent completion margin in meters (default: 0)",
     )
     parser.add_argument(
         "--vcodec",
@@ -473,6 +518,15 @@ def main() -> None:
     clip_warned: set[str] = set()
     rng = np.random.default_rng()
 
+    device = select_device(args.vla_device)
+    print(f"Loading VLA checkpoint {args.vla_checkpoint!r} on {device}...")
+    policy_bundle = make_policy(
+        args.vla_checkpoint,
+        wrist_hw=(512, 512),
+        overhead_hw=(512, 512),
+        device=device,
+    )
+
     print("Connecting to follower...")
     # Keep torque on a plain disconnect (crash / mid-loop exit) so the arm holds
     # rather than going limp; torque is only released deliberately at REST.
@@ -515,6 +569,20 @@ def main() -> None:
         """Read the real arm and convert to the sim joint frame."""
         actual = action_to_joints(follower.get_observation(), clamp_low)
         return real_frame_to_sim(actual, offsets)
+
+    def sync_sim_to_current_pose(viewer) -> tuple[dict[str, float], float]:
+        """Initialize MuJoCo state from the arm's current measured pose."""
+        arm_joints, gripper = read_current_sim_pose()
+        for name, value in arm_joints.items():
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            data.qpos[model.jnt_qposadr[jid]] = value
+            data.ctrl[actuator_id[name]] = value
+        gripper_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "gripper")
+        data.qpos[model.jnt_qposadr[gripper_jid]] = gripper
+        data.ctrl[actuator_id["gripper"]] = gripper
+        mujoco.mj_forward(model, data)
+        viewer.sync()
+        return arm_joints, gripper
 
     def move_to(arm_joints: dict[str, float], gripper: float, viewer) -> None:
         """Smoothly ramp the real arm and the sim onto ``arm_joints``/``gripper``."""
@@ -710,9 +778,13 @@ def main() -> None:
     try:
         with recover_on(KeyboardInterrupt, recover=park_from_interrupt):
             with viewer_ctx as viewer:
-                print("Homing to near-neutral...")
-                arm, grip = sample_near_neutral(rng)
-                move_to(arm, grip, viewer)
+                if args.start_from_current:
+                    print("Starting from current physical arm pose...")
+                    sync_sim_to_current_pose(viewer)
+                else:
+                    print("Homing to near-neutral...")
+                    arm, grip = sample_near_neutral(rng)
+                    move_to(arm, grip, viewer)
 
                 for ep in episode_loop(
                     target=args.episodes,
@@ -723,7 +795,7 @@ def main() -> None:
                     episode_target = fixed_target
                     if drop_zone_tracker is not None:
                         tracked_target = hunt_for_drop_zone(
-                            viewer, hunt=args.target_drop_zone
+                            viewer, hunt=args.target_drop_zone and not args.start_from_current
                         )
                         if not viewer.is_running():
                             break
@@ -802,6 +874,13 @@ def main() -> None:
                             show_wrist_cam=args.show_wrist_cam,
                             show_wrist_mixed=args.show_wrist_mixed,
                             failed_trajectory_dir=args.save_failed_trajectories,
+                            policy_bundle=policy_bundle,
+                            vla_instruction=args.task,
+                            vla_device=device,
+                            grasp_max_ticks=args.grasp_max_ticks,
+                            grasp_max_joint_speed=args.grasp_max_joint_speed,
+                            descent_margin=args.descent_margin,
+                            ascent_margin=args.ascent_margin,
                         )
 
                         if status == "restart":

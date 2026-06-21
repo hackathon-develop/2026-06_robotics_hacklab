@@ -1,0 +1,82 @@
+# CUDA/PyTorch GPU Fix Commands
+#
+# Copy/paste one block at a time. These commands are for the lerobot312 conda
+# environment. Your current issue is that torch is installed as cu130, but the
+# NVIDIA driver reports CUDA 12.9, so PyTorch refuses to initialize CUDA.
+
+
+###############################################################################
+# 1. Activate the environment
+###############################################################################
+
+conda activate lerobot312
+
+
+###############################################################################
+# 2. Check current PyTorch/CUDA state
+###############################################################################
+
+python -c "import torch; print('torch', torch.__version__); print('torch cuda build', torch.version.cuda); print('cuda available', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
+
+
+###############################################################################
+# 3. Remove the incompatible cu130 PyTorch build
+###############################################################################
+
+pip uninstall -y torch torchvision torchaudio
+
+
+###############################################################################
+# 4. Preferred option: install CUDA 12.9 PyTorch nightly wheels
+#
+# Use this first because your driver reports CUDA 12.9.
+###############################################################################
+
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu129
+
+
+###############################################################################
+# 5. Verify CUDA works after cu129 install
+#
+# Expected:
+# - torch version should include +cu129
+# - torch cuda build should be 12.9
+# - cuda available should be True
+# - device name should print your NVIDIA GPU
+###############################################################################
+
+python -c "import torch; print('torch', torch.__version__); print('torch cuda build', torch.version.cuda); print('cuda available', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
+
+
+###############################################################################
+# 6. Fallback option: install CUDA 12.8 stable wheels
+#
+# Only run this if the cu129 install fails or CUDA still does not work. A CUDA
+# 12.9 driver should normally be able to run CUDA 12.8 PyTorch wheels.
+###############################################################################
+
+pip uninstall -y torch torchvision torchaudio
+
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+
+###############################################################################
+# 7. Verify CUDA works after cu128 install
+#
+# Expected:
+# - torch version should include +cu128
+# - torch cuda build should be 12.8
+# - cuda available should be True
+# - device name should print your NVIDIA GPU
+###############################################################################
+
+python -c "import torch; print('torch', torch.__version__); print('torch cuda build', torch.version.cuda); print('cuda available', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
+
+
+###############################################################################
+# 8. If both options fail
+###############################################################################
+
+# If cu129 and cu128 both fail, update the NVIDIA driver, then reinstall the
+# original/latest PyTorch CUDA build. For your current installed torch cu130,
+# you need an NVIDIA driver new enough for CUDA 13.0.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -41,6 +42,10 @@ from wrist_align import (
     _scale_K as scale_wrist_K,
     wrist_alignment_from_frame,
 )
+from voice_trigger import DEFAULT_SAMPLE_RATE, DEFAULT_TRIGGER_PHRASES, parse_phrases
+
+
+DEFAULT_VOICE_MODEL_PATH = Path(__file__).parent / "models" / "vosk-model-small-en-us-0.15"
 
 
 class OverheadCameraReader:
@@ -159,9 +164,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run overhead pick pose plus wrist yaw handoff."
     )
-    parser.add_argument("camera_id", type=int, nargs="?", default=0, help="Overhead camera index.")
+    parser.add_argument(
+        "camera_id", type=int, nargs="?", default=0, help="Overhead camera index."
+    )
     parser.add_argument("--wrist-camera-id", type=int, default=1, help="Wrist camera index.")
-    parser.add_argument("--no-wrist-align", action="store_true", help="Skip wrist-camera rz estimate.")
+    parser.add_argument(
+        "--no-wrist-align", action="store_true", help="Skip wrist-camera rz estimate."
+    )
     parser.add_argument(
         "--model", default="rf-detr-base-o365", help="Overhead detection model."
     )
@@ -203,7 +212,9 @@ def parse_args() -> argparse.Namespace:
         default=[1, 0, 0, 0, 1, 0, 0, 0, 1],
         help="Overhead camera world rotation, row-major MuJoCo data.cam_xmat.",
     )
-    parser.add_argument("--pick-z", type=float, default=0.0, help="Table plane z in world meters.")
+    parser.add_argument(
+        "--pick-z", type=float, default=0.0, help="Table plane z in world meters."
+    )
     parser.add_argument(
         "--hover-offset",
         type=float,
@@ -225,7 +236,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rx", type=float, default=180.0, help="Default hover rx in degrees.")
     parser.add_argument("--ry", type=float, default=0.0, help="Default hover ry in degrees.")
     parser.add_argument("--rz", type=float, default=0.0, help="Fallback hover rz in degrees.")
-    parser.add_argument("--timeout", type=float, default=2.0, help="Camera read timeout in seconds.")
+    parser.add_argument(
+        "--timeout", type=float, default=2.0, help="Camera read timeout in seconds."
+    )
     parser.add_argument(
         "--no-window",
         action="store_true",
@@ -237,12 +250,87 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Milliseconds to keep the live overhead window after the sequence; 0 waits for q.",
     )
-    parser.add_argument("--move-arm", action="store_true", help="Move the follower to arm_hover_pose.")
+    parser.add_argument(
+        "--move-arm", action="store_true", help="Move the follower to arm_hover_pose."
+    )
+    parser.add_argument(
+        "--handoff-at-hover",
+        action="store_true",
+        help="hold at the first object hover pose instead of returning home after moving",
+    )
+    parser.add_argument(
+        "--run-real-place",
+        action="store_true",
+        help="after hover handoff, run py/scripts/pick_and_place/real.py for placement",
+    )
+    parser.add_argument("--real-episodes", type=int, default=1, help="episodes for real.py.")
+    parser.add_argument(
+        "--real-task",
+        default="Pick and grab the object.",
+        help="task string passed to real.py",
+    )
+    parser.add_argument(
+        "--real-target-drop-zone",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pass --target-drop-zone to real.py so it places on the black/white square",
+    )
+    parser.add_argument(
+        "--real-drop-zone-color",
+        choices=("black", "white"),
+        default="black",
+        help="drop-zone square color passed to real.py",
+    )
+    parser.add_argument(
+        "--real-no-viewer",
+        action="store_true",
+        help="run real.py headless with --no-viewer",
+    )
+    parser.add_argument(
+        "--real-vla-checkpoint",
+        default="",
+        help="SmolVLA checkpoint path passed to real.py; empty uses real.py default",
+    )
+    parser.add_argument(
+        "--real-vla-device",
+        default="auto",
+        help="VLA device passed to real.py: auto | cpu | mps | cuda",
+    )
+    parser.add_argument(
+        "--real-grasp-max-ticks",
+        type=int,
+        default=150,
+        help="maximum VLA ticks passed to real.py for the grasp handoff",
+    )
+    parser.add_argument(
+        "--real-grasp-max-joint-speed",
+        type=float,
+        default=10.0,
+        help="VLA joint-speed cap in deg/s passed to real.py",
+    )
+    parser.add_argument(
+        "--real-descent-margin",
+        type=float,
+        default=0.0,
+        help="reserved VLA descent margin passed to real.py",
+    )
+    parser.add_argument(
+        "--real-ascent-margin",
+        type=float,
+        default=0.0,
+        help="reserved VLA ascent margin passed to real.py",
+    )
     parser.add_argument("--follower-port", default="", help="Serial port of the SO-101 follower.")
     parser.add_argument("--follower-id", default="folly", help="Follower calibration id.")
-    parser.add_argument("--offsets-path", default=None, help="Optional sim->real joint offsets JSON.")
-    parser.add_argument("--move-duration", type=float, default=2.0, help="Minimum arm ramp duration.")
-    parser.add_argument("--control-hz", type=float, default=30.0, help="Arm command streaming rate.")
+    parser.add_argument(
+        "--offsets-path", default=None, help="Optional sim->real joint offsets JSON."
+    )
+    parser.add_argument(
+        "--move-duration", type=float, default=2.0, help="Minimum arm ramp duration."
+    )
+    parser.add_argument(
+        "--control-hz", type=float, default=30.0, help="Arm command streaming rate."
+    )
     parser.add_argument(
         "--max-joint-speed",
         type=float,
@@ -259,6 +347,38 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Print detailed detection, projection, and arm target debug.",
+    )
+    parser.add_argument(
+        "--voice-trigger",
+        action="store_true",
+        help="Wait for an offline voice trigger before running the first sequence.",
+    )
+    parser.add_argument(
+        "--voice-model",
+        default=str(DEFAULT_VOICE_MODEL_PATH),
+        help="Path to a local Vosk model directory.",
+    )
+    parser.add_argument(
+        "--voice-device",
+        default="",
+        help="Optional sounddevice input device index/name; empty uses the default input.",
+    )
+    parser.add_argument(
+        "--voice-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for the voice trigger; 0 waits forever.",
+    )
+    parser.add_argument(
+        "--voice-phrases",
+        default=",".join(DEFAULT_TRIGGER_PHRASES),
+        help="Comma-separated voice trigger phrases.",
+    )
+    parser.add_argument(
+        "--voice-sample-rate",
+        type=int,
+        default=DEFAULT_SAMPLE_RATE,
+        help="Microphone sample rate for Vosk recognition.",
     )
     return parser.parse_args()
 
@@ -324,10 +444,60 @@ def _print_detection_debug(
         )
 
 
+def _run_real_place(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    selected = payload["selected_pose"]
+    real_script = REPO_ROOT / "py" / "scripts" / "pick_and_place" / "real.py"
+    command = [
+        sys.executable,
+        str(real_script),
+        "--follower-port",
+        args.follower_port,
+        "--follower-id",
+        args.follower_id,
+        "--camera",
+        str(args.camera_id),
+        "--camera-name",
+        args.camera_name,
+        "--wrist-camera",
+        str(args.wrist_camera_id),
+        "--episodes",
+        str(args.real_episodes),
+        "--source",
+        str(float(selected["x"])),
+        str(float(selected["y"])),
+        "--task",
+        args.real_task,
+        "--start-from-current",
+    ]
+    if args.offsets_path is not None:
+        command.extend(["--offsets-path", str(args.offsets_path)])
+    if args.wrist_intrinsics.strip():
+        command.extend(["--wrist-intrinsics", args.wrist_intrinsics])
+    if args.real_target_drop_zone:
+        command.append("--target-drop-zone")
+        command.extend(["--drop-zone-color", args.real_drop_zone_color])
+    if args.real_no_viewer:
+        command.append("--no-viewer")
+    if args.real_vla_checkpoint.strip():
+        command.extend(["--vla-checkpoint", args.real_vla_checkpoint])
+    command.extend(["--vla-device", args.real_vla_device])
+    command.extend(["--grasp-max-ticks", str(args.real_grasp_max_ticks)])
+    command.extend(["--grasp-max-joint-speed", str(args.real_grasp_max_joint_speed)])
+    command.extend(["--descent-margin", str(args.real_descent_margin)])
+    command.extend(["--ascent-margin", str(args.real_ascent_margin)])
+
+    print("Starting analytic placement:", " ".join(command), file=sys.stderr)
+    subprocess.run(command, check=True)
+
+
 def main() -> None:
     args = parse_args()
     if args.move_arm and not args.dry_run_arm and not args.follower_port:
         raise SystemExit("--follower-port is required with --move-arm")
+    if args.run_real_place and not args.move_arm:
+        raise SystemExit("--run-real-place requires --move-arm")
+    if args.run_real_place and args.dry_run_arm:
+        raise SystemExit("--run-real-place cannot be used with --dry-run-arm")
     target_classes = target_classes_from_target_class(args.target_class)
 
     overhead_intrinsics = (
@@ -375,6 +545,18 @@ def main() -> None:
             raise SystemExit(f"Could not open wrist camera {args.wrist_camera_id}.")
 
     try:
+        if args.voice_trigger:
+            from voice_trigger import wait_for_voice_trigger
+
+            wait_for_voice_trigger(
+                model_path=args.voice_model,
+                phrases=parse_phrases(args.voice_phrases),
+                device=args.voice_device,
+                timeout_s=args.voice_timeout,
+                sample_rate=args.voice_sample_rate,
+            )
+            print("Starting first pick sequence...", file=sys.stderr)
+
         overhead_frame = overhead.latest(args.timeout)
         K_scaled = _scaled_intrinsics_for_frame(overhead_frame, K, calib_w, calib_h)
         poses = pick_poses_from_frame(
@@ -475,11 +657,21 @@ def main() -> None:
                 control_hz=args.control_hz,
                 max_joint_speed=args.max_joint_speed,
                 dry_run=args.dry_run_arm,
+                return_home=not (args.handoff_at_hover or args.run_real_place),
             )
             print(json.dumps({"arm_move": diagnostics}, indent=2), flush=True)
-        overhead.wait_for_window(args.window_ms)
+        if args.run_real_place:
+            overhead.close()
+            overhead = None
+            if wrist is not None:
+                wrist.release()
+                wrist = None
+            _run_real_place(args, payload)
+        if overhead is not None:
+            overhead.wait_for_window(args.window_ms)
     finally:
-        overhead.close()
+        if overhead is not None:
+            overhead.close()
         if wrist is not None:
             wrist.release()
 
