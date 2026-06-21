@@ -1,0 +1,40 @@
+# Merge multiple local LeRobot datasets
+
+lerobot-edit-dataset \
+  --new_repo_id pick-and-place-merged \
+  --new_root /home/vrazer/workspace/robotics/pick-and-place/py/datasets/pick-and-place-merged \
+  --operation.type merge \
+  --operation.repo_ids "['20260621_013132', '20260621_013533', '20260621_013849', '20260621_014250', '20260621_014609']" \
+  --operation.roots "['/home/vrazer/workspace/robotics/pick-and-place/py/datasets/20260621_013132', '/home/vrazer/workspace/robotics/pick-and-place/py/datasets/20260621_013533', '/home/vrazer/workspace/robotics/pick-and-place/py/datasets/20260621_013849', '/home/vrazer/workspace/robotics/pick-and-place/py/datasets/20260621_014250', '/home/vrazer/workspace/robotics/pick-and-place/py/datasets/20260621_014609']"
+
+# Train on merged dataset. Run this once online so lerobot/smolvla_base is cached.
+
+lerobot-train \
+  --policy.path=lerobot/smolvla_base \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=pick-and-place-merged \
+  --dataset.root=/home/vrazer/workspace/robotics/pick-and-place/py/datasets/pick-and-place-merged \
+  --rename_map='{"observation.images.overhead": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2"}' \
+  --steps=2048 \
+  --batch_size=8 \
+  --save_freq=50 \
+  --log_freq=10 \
+  --num_workers=4 \
+  --wandb.enable=true \
+  --wandb.project=pick-and-place
+
+# Optional: after the model is cached, this offline version should also work.
+
+HF_HUB_OFFLINE=1 lerobot-train \
+  --policy.path=lerobot/smolvla_base \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=pick-and-place-merged \
+  --dataset.root=/home/vrazer/workspace/robotics/pick-and-place/py/datasets/pick-and-place-merged \
+  --rename_map='{"observation.images.overhead": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2"}' \
+  --steps=2048 \
+  --batch_size=8 \
+  --save_freq=50 \
+  --log_freq=10 \
+  --num_workers=4 \
+  --wandb.enable=true \
+  --wandb.project=pick-and-place

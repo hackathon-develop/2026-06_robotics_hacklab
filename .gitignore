@@ -50,3 +50,7 @@ build
 /intermediary-glb
 /config/camera_intrinsics/*.json
 /config/camera_extrinsics/*.json
+
+perimeter_scene/
+py/scripts/hackathon/
+py/scripts/outputs/
