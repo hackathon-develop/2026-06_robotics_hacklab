@@ -21,7 +21,11 @@ Built for the 2026 Robotics Hacklab.
 | --- | --- | --- |
 | ![SO-101 real workspace](docs/images/real-workspace-front.jpeg) | ![SO-101 can pick setup](docs/images/real-workspace-side.jpeg) | ![SO-101 MuJoCo simulation](docs/images/so101-simulation.jpg) |
 
-| Overhead Camera Frame |
+| Detection Output |
+| --- |
+| ![Bottle detection output](docs/images/bottle-detection.jpg) |
+
+| Raw Overhead Camera Frame |
 | --- |
 | ![Overhead camera frame](docs/images/overhead-camera-frame.jpg) |
 
