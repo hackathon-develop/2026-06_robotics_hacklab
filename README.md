@@ -1,4 +1,4 @@
-# RoboSort SO-101
+# Tidybot SO-101
 
 ![RoboSort SO-101 workspace](docs/images/real-workspace-front.jpeg)
 
